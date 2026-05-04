@@ -1,0 +1,144 @@
+# ================================================================
+# GraphGPS — JS Library Obfuscation Detection
+# Derived from: malnettiny-GPS.yaml + ogbg-code2-GPS.yaml
+# Run: python main.py --cfg configs/custom/libs_scan.yaml wandb.use False
+# ================================================================
+ 
+out_dir: results
+metric_best: accuracy
+metric_agg: argmax # new
+name_tag: v3
+ 
+wandb:
+  use: True
+  project: js-lib-similarity
+ 
+# ----------------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------------
+dataset:
+  format: PyG-JSLibs
+  name: JSLibs
+  task: graph
+  task_type: classification
+  transductive: False
+  node_encoder: True
+  node_encoder_name: CPGNode+LapPE     # từ code2: có node features thật → dùng encoder riêng
+                                        # từ MalNet: không có → dùng LapPE làm node feat
+                                        # ta có cả hai → CPGNode + LapPE
+  node_encoder_bn: True                 # True vì combine 2 encodings
+  edge_encoder: True
+  edge_encoder_name: CPGEdge           # 11 edge types thật (khác MalNet dùng DummyEdge)
+  edge_encoder_bn: False               # giữ False như cả 2 refs
+  split_index: 0
+  split_mode: standard
+ 
+# ----------------------------------------------------------------
+# Positional Encoding — LapPE
+# ----------------------------------------------------------------
+# MalNet: enable=True, dùng LapPE làm node features chính (không có features khác)
+# code2 : enable=False, dùng ASTNode encoder đã đủ
+# Ta    : enable=True, LapPE bổ sung cho CPGNode (global structure)
+posenc_LapPE:
+  enable: True
+  eigen:
+    laplacian_norm: none               # none vì directed graph (MalNet cũng dùng none)
+    eigvec_norm: L2
+    max_freqs: 8                       # giảm từ 10 → graph nhỏ hơn cả 2 refs
+  model: DeepSet
+  dim_pe: 16
+  layers: 2                            # từ MalNet (dataset scale gần hơn)
+  n_heads: 4
+  raw_norm_type: none
+ 
+# ----------------------------------------------------------------
+# Structural Encoding — RWSE
+# ----------------------------------------------------------------
+# Không có trong cả 2 refs — thêm vì:
+# loop/branch pattern trong CFG ổn định sau obfuscation
+posenc_RWSE:
+  enable: True
+  kernel:
+    times: [1, 2, 4, 8, 16]
+  model: Linear
+  dim_pe: 16
+  raw_norm_type: none
+ 
+# ----------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------
+train:
+  mode: custom
+  batch_size: 16                       # từ MalNet (dataset nhỏ)
+  eval_period: 1
+  ckpt_period: 100
+  enable_ckpt: True
+  ckpt_best: True
+ 
+# ----------------------------------------------------------------
+# Model
+# ----------------------------------------------------------------
+model:
+  type: GPSModel
+  loss_fun: cross_entropy              # placeholder — NT-Xent tính ngoài train loop
+  edge_decoding: dot
+  graph_pooling: max                   # từ MalNet — 1 function match là đủ detect lib
+ 
+# ----------------------------------------------------------------
+# GPS layers
+# ----------------------------------------------------------------
+# layer_type : từ cả 2 — GatedGCN xử lý edge features, Performer linear O(N)
+# layers     : 4 từ code2 (graph có semantic features, không cần sâu như MalNet=5)
+# dim_hidden : 128 — trung gian giữa MalNet(64) và code2(256)
+#              MalNet dùng 64 vì không có features → embedding space nhỏ đủ
+#              code2 dùng 256 vì dataset lớn + rich features
+#              Ta có features nhưng dataset nhỏ → 128
+gt:
+  layer_type: CustomGatedGCN+Performer
+  layers: 4
+  n_heads: 4
+  dim_hidden: 128                      # PHẢI match gnn.dim_inner
+  dropout: 0.1                         # nhẹ hơn code2(0.2), hơn MalNet(0.0)
+  attn_dropout: 0.5                    # cả 2 refs đồng thuận
+  layer_norm: False
+  batch_norm: True
+ 
+# ----------------------------------------------------------------
+# GNN head
+# ----------------------------------------------------------------
+# head           : default từ MalNet (classification), không dùng ogb_code_graph
+# layers_post_mp : 2 — trung gian MalNet(3) và code2(1)
+# agg            : max — match graph_pooling=max (MalNet dùng mean nhưng pooling=max)
+gnn:
+  head: default
+  layers_pre_mp: 0
+  layers_post_mp: 2
+  dim_inner: 128                       # PHẢI match gt.dim_hidden
+  batchnorm: True
+  act: relu
+  dropout: 0.0
+  agg: max                             # match graph_pooling
+  normalize_adj: False
+ 
+# ----------------------------------------------------------------
+# Optimizer
+# ----------------------------------------------------------------
+# base_lr          : 0.0002 — giữa MalNet(0.0005) và code2(0.0001)
+# max_epoch        : 100 — giữa MalNet(150) và code2(30), dataset nhỏ cần nhiều epoch
+# num_warmup_epochs: 8 (~8% tổng) — gần MalNet(10/150≈7%) hơn code2(2/30≈7%)
+optim:
+  clip_grad_norm: True
+  optimizer: adamW
+  weight_decay: 1e-5
+  base_lr: 0.0002
+  max_epoch: 100
+  scheduler: cosine_with_warmup
+  num_warmup_epochs: 8
+  # Required bởi ExtendedSchedulerConfig trong main.py dù không dùng
+  steps: [60, 80]
+  lr_decay: 0.1
+  reduce_factor: 0.5
+  schedule_patience: 10
+  min_lr: 1e-6
+  momentum: 0.9
+ 

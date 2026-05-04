@@ -1,0 +1,156 @@
+# ================================================================
+# GraphGPS — JS Library Detection (Inference)
+# Loads a pretrained checkpoint and runs jslibs-inference mode.
+#
+# Run:
+#   python main.py --cfg configs/custom/libs_scan_v3-inference.yaml
+#
+# Override checkpoint at the command line:
+#   python main.py --cfg configs/custom/libs_scan_v3-inference.yaml \
+#       pretrained.dir pretrained/jslibs-v3
+#
+# Override graphs directory (for a single new bundle):
+#   python main.py --cfg configs/custom/libs_scan_v3-inference.yaml \
+#       dataset.dir datasets/MyBundle
+#
+# Override aggregation strategy:
+#   python main.py --cfg configs/custom/libs_scan_v3-inference.yaml \
+#       jslibs.aggregation vote
+# ================================================================
+
+out_dir: results
+metric_best: accuracy
+metric_agg: argmax
+name_tag: v3-inference
+
+wandb:
+  use: False
+  project: js-lib-similarity
+
+# ----------------------------------------------------------------
+# Pretrained checkpoint
+# Mirrors the pattern from configs/GPS/pcqm4m-GPSdeep-inference.yaml
+# ----------------------------------------------------------------
+pretrained:
+  dir: pretrained/jslibs-v3          # directory containing best.ckpt
+  reset_prediction_head: False       # keep the trained classification head
+
+# ----------------------------------------------------------------
+# Dataset  (same encoders as training — must not change)
+# ----------------------------------------------------------------
+dataset:
+  format: PyG-JSLibs
+  name: JSLibs
+  task: graph
+  task_type: classification
+  transductive: False
+  node_encoder: True
+  node_encoder_name: CPGNode+LapPE
+  node_encoder_bn: True
+  edge_encoder: True
+  edge_encoder_name: CPGEdge
+  edge_encoder_bn: False
+  split_index: 0
+  split_mode: standard
+  dir: datasets/JSLibs               # override for a new bundle if needed
+
+# ----------------------------------------------------------------
+# Positional / Structural encodings  (identical to training)
+# ----------------------------------------------------------------
+posenc_LapPE:
+  enable: True
+  eigen:
+    laplacian_norm: none
+    eigvec_norm: L2
+    max_freqs: 8
+  model: DeepSet
+  dim_pe: 16
+  layers: 2
+  n_heads: 4
+  raw_norm_type: none
+
+posenc_RWSE:
+  enable: True
+  kernel:
+    times: [1, 2, 4, 8, 16]
+  model: Linear
+  dim_pe: 16
+  raw_norm_type: none
+
+# ----------------------------------------------------------------
+# Inference mode  ← only change vs training config
+# ----------------------------------------------------------------
+train:
+  mode: jslibs-inference             # registered in custom_train.py
+  batch_size: 32                     # larger batch: no gradients needed
+  eval_period: 1
+  ckpt_period: 100
+  enable_ckpt: False
+
+# ----------------------------------------------------------------
+# Model  (must match the training checkpoint exactly)
+# ----------------------------------------------------------------
+model:
+  type: GPSModel
+  loss_fun: cross_entropy
+  edge_decoding: dot
+  graph_pooling: max
+
+gt:
+  layer_type: CustomGatedGCN+Performer
+  layers: 4
+  n_heads: 4
+  dim_hidden: 128
+  dropout: 0.0                       # disabled at inference
+  attn_dropout: 0.0                  # disabled at inference
+  layer_norm: False
+  batch_norm: True
+
+gnn:
+  head: default
+  layers_pre_mp: 0
+  layers_post_mp: 2
+  dim_inner: 128
+  batchnorm: True
+  act: relu
+  dropout: 0.0
+  agg: max
+  normalize_adj: False
+
+# ----------------------------------------------------------------
+# Optimizer  (unused at inference — required by framework schema)
+# ----------------------------------------------------------------
+optim:
+  clip_grad_norm: True
+  clip_grad_norm_value: 1.0
+  optimizer: adamW
+  weight_decay: 1.0e-5
+  base_lr: 0.0002
+  max_epoch: 1                       # single "epoch" = one inference pass
+  scheduler: cosine_with_warmup
+  num_warmup_epochs: 0
+  steps: [1]
+  lr_decay: 0.1
+  reduce_factor: 0.5
+  schedule_patience: 10
+  min_lr: 1.0e-6
+  momentum: 0.9
+
+# ----------------------------------------------------------------
+# JSLibs inference settings
+# ----------------------------------------------------------------
+jslibs:
+  # Path to split.json used during training (reconstructs idx→lib_name map)
+  split_json: datasets/JSLibs/raw/split.json
+
+  # Number of top library predictions to report
+  topk: 5
+
+  # Aggregation strategy across function-level predictions:
+  #   sum_log_prob  — sum log P(lib|fn) over all functions  [default, MLE]
+  #   max_prob      — max P(lib|fn) across functions        [presence detection]
+  #   vote          — count argmax votes per lib            [majority consensus]
+  aggregation: sum_log_prob
+
+  # Output path for JSON predictions (empty = auto: results/<run>/jslibs_predictions.json)
+  output_json: ""
