@@ -14,6 +14,7 @@ from graphgps.encoder.type_dict_encoder import TypeDictNodeEncoder
 from graphgps.encoder.linear_node_encoder import LinearNodeEncoder
 from graphgps.encoder.equivstable_laplace_pos_encoder import EquivStableLapPENodeEncoder
 from graphgps.encoder.graphormer_encoder import GraphormerEncoder
+from graphgps.encoder.cpg_encoder import CPGNodeEncoder
 
 
 def concat_node_encoders(encoder_classes, pe_enc_names):
@@ -105,7 +106,8 @@ ds_encs = {'Atom': AtomEncoder,
            'PPANode': PPANodeEncoder,
            'TypeDictNode': TypeDictNodeEncoder,
            'VOCNode': VOCNodeEncoder,
-           'LinearNode': LinearNodeEncoder}
+           'LinearNode': LinearNodeEncoder,
+           'CPGNode': CPGNodeEncoder}
 
 # Positional Encoding node encoders.
 pe_encs = {'LapPE': LapPENodeEncoder,

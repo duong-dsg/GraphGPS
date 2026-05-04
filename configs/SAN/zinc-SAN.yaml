@@ -1,4 +1,4 @@
-out_dir: results
+ out_dir: results
 metric_best: mae
 metric_agg: argmin
 wandb:

@@ -383,3 +383,191 @@ def log_attn_weights(loggers, loaders, model, optimizer=None, scheduler=None):
     torch.save(output, save_file)
 
     logging.info(f'Done! took: {time.perf_counter() - start_time:.2f}s')
+
+
+# ============================================================
+# JSLibs inference pipeline
+# Registered as train.mode: jslibs-inference
+# ============================================================
+ 
+import json
+import os
+import os.path as osp
+from pathlib import Path
+from typing import Dict, List, Optional
+ 
+import torch.nn.functional as F
+ 
+ 
+def _build_label_map(split_json: str) -> Dict[int, str]:
+    """Rebuild idx→lib_name from the split.json used at training time."""
+    with open(split_json) as f:
+        lib_split = json.load(f)
+    all_libs = sorted(lib_split.keys())
+    return {i: lib for i, lib in enumerate(all_libs)}
+ 
+ 
+@torch.no_grad()
+def _jslibs_predict_epoch(loader, model, device, label_map, aggregation="sum_log_prob"):
+    """
+    Run one pass over a loader of unlabelled CPG graphs.
+ 
+    Returns a ranked list of dicts:
+        [{"rank", "lib", "score", "confidence", "supporting_functions",
+          "total_functions"}, ...]
+    """
+    model.eval()
+    num_classes   = len(label_map)
+    agg_scores    = torch.zeros(num_classes, device=device)
+    vote_counts   = torch.zeros(num_classes, device=device)
+    max_probs     = torch.zeros(num_classes, device=device)
+    total_funcs   = 0
+ 
+    for batch in loader:
+        batch.split = 'test'
+        batch.to(device)
+ 
+        # GPSModel head returns (pred, true); pred = logits [B, C]
+        out = model(batch)
+        if isinstance(out, (tuple, list)):
+            logits = out[0]
+        else:
+            # batch object — GraphGPS default head stores pred in batch.y_pred
+            logits = batch.y_pred
+ 
+        if logits.shape[-1] != num_classes:
+            raise RuntimeError(
+                f"Model output dim {logits.shape[-1]} ≠ num_classes {num_classes}. "
+                "Ensure the checkpoint and split.json are from the same run."
+            )
+ 
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs     = log_probs.exp()
+ 
+        agg_scores += log_probs.sum(dim=0)
+        max_probs   = torch.maximum(max_probs, probs.max(dim=0).values)
+        for v in probs.argmax(dim=-1):
+            vote_counts[v] += 1
+        total_funcs += logits.shape[0]
+ 
+    # --- Select aggregation ---
+    if aggregation == "sum_log_prob":
+        final_scores = agg_scores
+    elif aggregation == "max_prob":
+        final_scores = max_probs
+    elif aggregation == "vote":
+        final_scores = vote_counts
+    else:
+        raise ValueError(f"Unknown aggregation '{aggregation}'. "
+                         "Choose from: sum_log_prob, max_prob, vote")
+ 
+    topk        = min(cfg.jslibs.topk, num_classes)
+    top_vals, top_idx = torch.topk(final_scores.cpu(), k=topk)
+    display_conf = F.softmax(top_vals.float(), dim=0).tolist()
+ 
+    results = []
+    for rank, (idx, score, conf) in enumerate(
+        zip(top_idx.tolist(), top_vals.tolist(), display_conf), start=1
+    ):
+        results.append({
+            "rank":                 rank,
+            "lib":                  label_map[idx],
+            "score":                round(score, 4),
+            "confidence":           round(conf, 4),
+            "supporting_functions": int(vote_counts[idx].item()),
+            "total_functions":      total_funcs,
+        })
+    return results
+ 
+ 
+def _print_predictions(preds: List[Dict], title: str = "JSLibs Detection") -> None:
+    sep = "─" * 64
+    logging.info("=" * 64)
+    logging.info(f"  {title}")
+    logging.info("=" * 64)
+    logging.info(f"  {'Rank':<5} {'Library':<30} {'Conf':>6}  {'Votes':>10}")
+    logging.info(sep)
+    for p in preds:
+        votes_str = f"{p['supporting_functions']}/{p['total_functions']}"
+        logging.info(
+            f"  {p['rank']:<5} {p['lib']:<30} "
+            f"{p['confidence']:>5.1%}  {votes_str:>10}"
+        )
+    logging.info("=" * 64)
+ 
+ 
+@register_train('jslibs-inference')
+def jslibs_inference(loggers, loaders, model, optimizer=None, scheduler=None):
+    """
+    Inference-only pipeline for JSLibs library detection.
+ 
+    Differences from the built-in 'inference-only' mode:
+      - Does NOT require batch.y labels (loader can be unlabelled)
+      - Aggregates per-function logits → per-lib scores
+      - Writes ranked JSON predictions to cfg.run_dir/jslibs_predictions.json
+ 
+    Required cfg keys (add to your .yaml under a `jslibs:` block):
+        jslibs:
+          split_json:  datasets/JSLibs/raw/split.json
+          topk:        5
+          aggregation: sum_log_prob   # or max_prob / vote
+          output_json: ""             # optional override path
+ 
+    The loaders list follows the same convention as other train modes:
+      loaders[0] = train (skipped here),  loaders[-1] = test / inference set.
+    To run on a custom set, simply pass a DataLoader wrapping your CPG graphs
+    as loaders[-1].
+ 
+    Usage in config:
+        train:
+          mode: jslibs-inference
+    """
+    start_time = time.perf_counter()
+    device = torch.device(cfg.accelerator)
+ 
+    # ---- Config defaults (safe even if jslibs block missing) ----
+    split_json  = getattr(cfg, 'jslibs', {}).get(
+        'split_json', osp.join(cfg.dataset.dir, 'raw', 'split.json'))
+    topk        = getattr(cfg, 'jslibs', {}).get('topk', 5)
+    aggregation = getattr(cfg, 'jslibs', {}).get('aggregation', 'sum_log_prob')
+    output_json = getattr(cfg, 'jslibs', {}).get('output_json', '')
+ 
+    # Patch cfg so _jslibs_predict_epoch can read topk cleanly
+    if not hasattr(cfg, 'jslibs'):
+        cfg.jslibs = type('JSLibsCfg', (), {})()
+    cfg.jslibs.topk = topk
+ 
+    if not osp.isfile(split_json):
+        raise FileNotFoundError(
+            f"split.json not found at '{split_json}'. "
+            "Set jslibs.split_json in your config."
+        )
+ 
+    label_map = _build_label_map(split_json)
+    logging.info(f"[JSLibs] {len(label_map)} library classes loaded from {split_json}")
+    logging.info(f"[JSLibs] Aggregation: {aggregation} | Top-K: {topk}")
+ 
+    # Use the last loader (test / inference set).
+    # If you have a single custom loader, pass it as loaders[-1].
+    inference_loader = loaders[-1]
+    logging.info(
+        f"[JSLibs] Running inference on {len(inference_loader.dataset)} function graphs"
+    )
+ 
+    preds = _jslibs_predict_epoch(
+        loader      = inference_loader,
+        model       = model,
+        device      = device,
+        label_map   = label_map,
+        aggregation = aggregation,
+    )
+ 
+    _print_predictions(preds, title=f"JSLibs Detection  [{aggregation}]")
+ 
+    # ---- Save JSON ----
+    if not output_json:
+        output_json = osp.join(cfg.run_dir, 'jslibs_predictions.json')
+    Path(output_json).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_json).write_text(json.dumps(preds, indent=2))
+    logging.info(f"[JSLibs] Predictions saved → {output_json}")
+    logging.info(f"[JSLibs] Done in {time.perf_counter() - start_time:.2f}s")

@@ -18,6 +18,7 @@ from graphgps.loader.dataset.aqsol_molecules import AQSOL
 from graphgps.loader.dataset.coco_superpixels import COCOSuperpixels
 from graphgps.loader.dataset.malnet_tiny import MalNetTiny
 from graphgps.loader.dataset.voc_superpixels import VOCSuperpixels
+from graphgps.loader.dataset.jslibs import JSLibsDataset  # new
 from graphgps.loader.split_generator import (prepare_splits,
                                              set_dataset_splits)
 from graphgps.transform.posenc_stats import compute_posenc_stats
@@ -140,6 +141,9 @@ def load_dataset_master(format, name, dataset_dir):
         elif pyg_dataset_id == 'COCOSuperpixels':
             dataset = preformat_COCOSuperpixels(dataset_dir, name,
                                                 cfg.dataset.slic_compactness)
+            
+        elif pyg_dataset_id == 'JSLibs':
+            dataset = preformat_JSLibs(dataset_dir, name)
 
         else:
             raise ValueError(f"Unexpected PyG Dataset identifier: {format}")
@@ -638,3 +642,74 @@ def join_dataset_splits(datasets):
     datasets[0].split_idxs = split_idxs
 
     return datasets[0]
+
+
+ 
+
+def preformat_JSLibs(dataset_dir, name):
+    """
+    Load JS Libraries dataset (Joern → PyG → GraphGPS-ready)
+    Args:
+        dataset_dir: root dir (vd: datasets/JSLibs)
+        name: unused (giữ để compatible GraphGym)
+    Returns:
+        PyG dataset object (InMemoryDataset)
+    """
+    # ---- Load dataset ----
+    dataset = JSLibsDataset(root=dataset_dir)
+    dataset.name = "JSLibs"
+    # =========================
+    # 1. Split handling (CRITICAL)
+    # =========================
+    split_dict = dataset.get_idx_split()
+    dataset.split_idxs = [
+        split_dict['train'],
+        split_dict['valid'],
+        split_dict['test']
+    ]
+    logging.info(
+        f"Splits: train={len(split_dict['train'])}, "
+        f"val={len(split_dict['valid'])}, "
+        f"test={len(split_dict['test'])}"
+    )
+    # =========================
+    # 2. Fix node features
+    # =========================
+    if not hasattr(dataset.data, 'x') or dataset.data.x is None:
+        logging.warning("No node features found → using dummy features")
+        dataset.data.x = torch.ones((dataset.data.num_nodes, 1))
+    # đảm bảo float (GraphGPS yêu cầu)
+    if dataset.data.x.dtype != torch.float:
+        dataset.data.x = dataset.data.x.float()
+    # =========================
+    # 3. Fix edge features
+    # =========================
+    if hasattr(dataset.data, 'edge_attr') and dataset.data.edge_attr is not None:
+        if dataset.data.edge_attr.dim() == 1:
+            dataset.data.edge_attr = dataset.data.edge_attr.view(-1, 1)
+        dataset.data.edge_attr = dataset.data.edge_attr.long()
+    else:
+        # fallback nếu không có edge_attr
+        num_edges = dataset.data.edge_index.shape[1]
+        dataset.data.edge_attr = torch.zeros((num_edges, 1), dtype=torch.long)
+    # =========================
+    # 4. Task definition
+    # =========================
+    if hasattr(dataset.data, 'y') and dataset.data.y is not None:
+        dataset.data.y = dataset.data.y.view(-1)
+        # dataset.num_classes = int(dataset.data.y.max().item() + 1)
+    else:
+        raise ValueError("Dataset must have 'y' for classification task")
+    logging.info(f"Num classes: {dataset.num_classes}")
+    # =========================
+    # 5. Graph-level task flag (important)
+    # =========================
+    dataset.task_type = 'classification'
+    dataset.eval_metric = 'accuracy'
+    # =========================
+    # 6. Sanity check
+    # =========================
+    assert len(dataset) > 0, "Dataset is empty"
+    assert dataset.data.edge_index is not None
+    return dataset
+ 
