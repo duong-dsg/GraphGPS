@@ -1,564 +1,502 @@
+"""
+graphgps/loader/dataset/jslibs.py
+ 
+Supports two split.json schemas produced by build_split.py:
+ 
+  closed mode  (recommended first):
+    {
+      "axios@1.7.9": {
+        "rollup@4.46.2/graphs/func_001.xml": "train",
+        "rollup@4.46.2/graphs/func_002.xml": "val",
+        ...
+      }
+    }
+    → same lib appears in train + val + test, just different graphs.
+    → standard N-class CrossEntropyLoss classifier works correctly.
+ 
+  open mode:
+    { "axios@1.7.9": "train", "lodash@4.17.21": "test", ... }
+    → each lib is entirely in one split.
+    → requires metric learning at inference; softmax head will give ~0% on test.
+"""
+ 
 import json
 import logging
 import os
 import os.path as osp
-from typing import Dict, Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
  
-import torch
 import networkx as nx
 import pydot
-from torch_geometric.data import Data, InMemoryDataset
+import torch
+import torch.nn as nn
 import xml.etree.ElementTree as ET
-
-from typing import Dict, List, Optional, Tuple
- 
+from torch_geometric.data import Data, InMemoryDataset
  
 log = logging.getLogger(__name__)
  
-# ---- Edge type mapping (GLOBAL FIXED) ----
-EDGE_TYPE_MAP = {
-    "AST": 0,
-    "CFG": 1,
-    "REACHING_DEF": 2,  # PDG
-    "CDG": 3,
-}
  
-EDGE_GROUPS = {
-    # ---- Syntax ----
-    "AST": 0,
-    "CONTAINS": 0,
+# =============================================================================
+# Constants
+# =============================================================================
  
-    # ---- Control Flow ----
-    "CFG": 1,
-    "DOMINATE": 1,
-    "POST_DOMINATE": 1,
- 
-    # ---- Data Flow ----
+EDGE_GROUPS: Dict[str, int] = {
+    "AST": 0, "CONTAINS": 0,
+    "CFG": 1, "DOMINATE": 1, "POST_DOMINATE": 1,
     "REACHING_DEF": 2,
- 
-    # ---- Control Dependence ----
     "CDG": 3,
- 
-    # ---- Call / Argument ----
-    "CALL": 4,
-    "ARGUMENT": 4,
-    "PARAMETER_LINK": 4,
- 
-    # ---- Reference ----
+    "CALL": 4, "ARGUMENT": 4, "PARAMETER_LINK": 4,
     "REF": 5,
 }
+NUM_EDGE_GROUPS  = len(set(EDGE_GROUPS.values()))   # 6
+NODE_FEATURE_DIM = 128
  
  
-# =========================
-# DOT → PyG utils
-# =========================
-def read_dot(path):
+# =============================================================================
+# Split schema detection
+# =============================================================================
+ 
+def detect_split_mode(lib_split: Dict) -> str:
+    """
+    Returns "closed" or "open" by inspecting the first value in split.json.
+      closed → first value is a dict  {"bundler@ver/graphs/fname": "train", ...}
+      open   → first value is a str   "train" | "val" | "test"
+    """
+    first = next(iter(lib_split.values()))
+    if isinstance(first, dict):
+        return "closed"
+    if isinstance(first, str):
+        return "open"
+    raise ValueError(
+        f"Unrecognised split.json schema — expected str or dict values, got {type(first)}"
+    )
+ 
+ 
+# =============================================================================
+# Graph I/O
+# =============================================================================
+ 
+def _read_dot(path: str) -> nx.MultiDiGraph:
     graphs = pydot.graph_from_dot_file(path)
     if not graphs:
-        raise ValueError(f"Cannot parse DOT: {path}")
- 
+        raise ValueError(f"pydot returned empty list: {path}")
     P = graphs[0]
- 
-    # Fix compatibility issue
-    try:
-        G = nx.drawing.nx_pydot.from_pydot(P)
-    except TypeError:
-        # fallback manual conversion
-        G = nx.MultiDiGraph()
- 
-        for node in P.get_nodes():
-            G.add_node(node.get_name(), **node.get_attributes())
- 
-        for edge in P.get_edges():
-            G.add_edge(
-                edge.get_source(),
-                edge.get_destination(),
-                **edge.get_attributes()
-            )
- 
-    return G
- 
- 
-def read_dot_safe(path):
-    graphs = pydot.graph_from_dot_file(path)
-    if not graphs:
-        raise ValueError(f"Cannot parse DOT: {path}")
- 
-    P = graphs[0]
- 
-    # Tự build graph → tránh bug networkx-pydot
     G = nx.MultiDiGraph()
- 
-    # ---- Nodes ----
     for node in P.get_nodes():
         name = node.get_name()
- 
-        # Skip node ảo của pydot
         if name in ("node", "graph", "edge"):
             continue
- 
-        name = name.strip('"')
+        name  = name.strip('"')
         attrs = {k: v.strip('"') for k, v in node.get_attributes().items()}
         G.add_node(name, **attrs)
- 
-    # ---- Edges ----
     for edge in P.get_edges():
-        src = edge.get_source().strip('"')
-        dst = edge.get_destination().strip('"')
+        src   = edge.get_source().strip('"')
+        dst   = edge.get_destination().strip('"')
         attrs = {k: v.strip('"') for k, v in edge.get_attributes().items()}
         G.add_edge(src, dst, **attrs)
- 
     return G
  
  
-def read_xml_safe(path):
-    # ---- Try GraphML ----
-    try:
-        G = nx.read_graphml(path)
-        return nx.MultiDiGraph(G)
-    except Exception:
-        pass
- 
-    # ---- Try GEXF ----
-    try:
-        G = nx.read_gexf(path)
-        return nx.MultiDiGraph(G)
-    except Exception:
-        pass
- 
-    # ---- Custom XML fallback ----
-    G = nx.MultiDiGraph()
- 
-    tree = ET.parse(path)
-    root = tree.getroot()
- 
-    # heuristic: find nodes
+def _read_xml(path: str) -> nx.MultiDiGraph:
+    for reader in (nx.read_graphml, nx.read_gexf):
+        try:
+            return nx.MultiDiGraph(reader(path))
+        except Exception:
+            pass
+    G    = nx.MultiDiGraph()
+    root = ET.parse(path).getroot()
     for node in root.findall(".//node"):
         nid = node.get("id")
         if nid is None:
             continue
- 
-        attrs = {}
-        for k, v in node.attrib.items():
-            attrs[k] = v
- 
-        # parse nested <data key="label">
-        for data in node.findall(".//data"):
-            key = data.get("key")
-            val = data.text
-            if key and val:
-                attrs[key] = val
- 
+        attrs = dict(node.attrib)
+        for d in node.findall(".//data"):
+            if d.get("key") and d.text:
+                attrs[d.get("key")] = d.text
         G.add_node(nid, **attrs)
- 
-    # heuristic: find edges
     for edge in root.findall(".//edge"):
-        src = edge.get("source")
-        dst = edge.get("target")
- 
+        src, dst = edge.get("source"), edge.get("target")
         if src is None or dst is None:
             continue
- 
-        attrs = {}
-        for k, v in edge.attrib.items():
-            attrs[k] = v
- 
-        for data in edge.findall(".//data"):
-            key = data.get("key")
-            val = data.text
-            if key and val:
-                attrs[key] = val
- 
+        attrs = dict(edge.attrib)
+        for d in edge.findall(".//data"):
+            if d.get("key") and d.text:
+                attrs[d.get("key")] = d.text
         G.add_edge(src, dst, **attrs)
- 
     return G
  
  
-def encode_edges_grouped(G, node2id):
-    edge_index = []
-    edge_attr = []
- 
-    for u, v, attr in G.edges(data=True):
-        if u not in node2id or v not in node2id:
-            continue
- 
-        src = node2id[u]
-        dst = node2id[v]
- 
-        etype = (
-            attr.get("label") or
-            attr.get("type") or
-            "AST"
-        )
- 
-        group = EDGE_GROUPS.get(etype, 0)
- 
-        # ---- Forward edge ----
-        edge_index.append([src, dst])
-        edge_attr.append([group, 0])  # 0 = forward
- 
-        # ---- Reverse edge (VERY IMPORTANT for GNN) ----
-        edge_index.append([dst, src])
-        edge_attr.append([group, 1])  # 1 = reverse
- 
-    if len(edge_index) == 0:
-        return None, None
- 
-    edge_index = torch.tensor(edge_index).t().contiguous()
-    edge_attr = torch.tensor(edge_attr, dtype=torch.long)
- 
-    return edge_index, edge_attr
+def load_graph(path: str) -> nx.MultiDiGraph:
+    if path.endswith(".dot"):
+        return _read_dot(path)
+    if path.endswith(".xml"):
+        return _read_xml(path)
+    raise ValueError(f"Unsupported extension: {path}")
  
  
-# =========================
-# Helper
-# =========================
-def _load_graph_from_file(fpath: str):
-    """
-    Load a single .dot or .xml file → nx.MultiDiGraph.
-    Mirrors the logic in jslibs.py so features are identical to training.
-    """
-    import networkx as nx
-    import pydot
-    import xml.etree.ElementTree as ET
+# =============================================================================
+# Feature encoding
+# =============================================================================
  
-    fname = osp.basename(fpath)
- 
-    if fname.endswith(".dot"):
-        graphs = pydot.graph_from_dot_file(fpath)
-        if not graphs:
-            raise ValueError(f"Cannot parse DOT: {fpath}")
-        P = graphs[0]
-        G = nx.MultiDiGraph()
-        for node in P.get_nodes():
-            name = node.get_name()
-            if name in ("node", "graph", "edge"):
-                continue
-            name = name.strip('"')
-            attrs = {k: v.strip('"') for k, v in node.get_attributes().items()}
-            G.add_node(name, **attrs)
-        for edge in P.get_edges():
-            src = edge.get_source().strip('"')
-            dst = edge.get_destination().strip('"')
-            attrs = {k: v.strip('"') for k, v in edge.get_attributes().items()}
-            G.add_edge(src, dst, **attrs)
- 
-    elif fname.endswith(".xml"):
-        try:
-            G = nx.read_graphml(fpath)
-            G = nx.MultiDiGraph(G)
-        except Exception:
-            try:
-                G = nx.read_gexf(fpath)
-                G = nx.MultiDiGraph(G)
-            except Exception:
-                G = nx.MultiDiGraph()
-                tree = ET.parse(fpath)
-                root = tree.getroot()
-                for node in root.findall(".//node"):
-                    nid = node.get("id")
-                    if nid is None:
-                        continue
-                    attrs = dict(node.attrib)
-                    for data in node.findall(".//data"):
-                        k, v = data.get("key"), data.text
-                        if k and v:
-                            attrs[k] = v
-                    G.add_node(nid, **attrs)
-                for edge in root.findall(".//edge"):
-                    src, dst = edge.get("source"), edge.get("target")
-                    if src is None or dst is None:
-                        continue
-                    attrs = dict(edge.attrib)
-                    for data in edge.findall(".//data"):
-                        k, v = data.get("key"), data.text
-                        if k and v:
-                            attrs[k] = v
-                    G.add_edge(src, dst, **attrs)
-    else:
-        raise ValueError(f"Unsupported file type: {fpath}")
- 
-    return G
- 
- 
-def nx_graph_to_pyg(G) -> Optional[Data]:
-    """Convert nx.MultiDiGraph → torch_geometric.data.Data (no label)."""
-    if G.number_of_nodes() == 0:
-        return None
- 
-    node2id = {n: i for i, n in enumerate(G.nodes())}
-    dim = 128
-    x = torch.zeros((len(node2id), dim))
- 
+def _encode_nodes(G: nx.MultiDiGraph, node2id: Dict) -> torch.Tensor:
+    x = torch.zeros((len(node2id), NODE_FEATURE_DIM))
     for node, attr in G.nodes(data=True):
-        idx = node2id[node]
-        label = attr.get("label", "UNK")
-        h = hash(label) % dim
-        x[idx][h] = 1.0
+        h = hash(attr.get("label", "UNK")) % NODE_FEATURE_DIM
+        x[node2id[node]][h] = 1.0
+    return x
  
-    edge_index, edge_attr = [], []
+ 
+def _encode_edges(
+    G: nx.MultiDiGraph, node2id: Dict
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ei, ea = [], []
     for u, v, attr in G.edges(data=True):
         if u not in node2id or v not in node2id:
             continue
-        src, dst = node2id[u], node2id[v]
-        etype = attr.get("label") or attr.get("type") or "AST"
-        group = EDGE_GROUPS.get(etype, 0)
-        edge_index.append([src, dst]);  edge_attr.append([group, 0])
-        edge_index.append([dst, src]);  edge_attr.append([group, 1])
- 
-    if not edge_index:
-        return None
- 
-    return Data(
-        x=x,
-        edge_index=torch.tensor(edge_index).t().contiguous(),
-        edge_attr=torch.tensor(edge_attr, dtype=torch.long),
-        num_nodes=len(node2id),
+        src  = node2id[u];  dst = node2id[v]
+        grp  = EDGE_GROUPS.get(attr.get("label") or attr.get("type") or "AST", 0)
+        ei  += [[src, dst], [dst, src]]
+        ea  += [[grp, 0],   [grp, 1]]
+    if not ei:
+        return None, None
+    return (
+        torch.tensor(ei, dtype=torch.long).t().contiguous(),
+        torch.tensor(ea, dtype=torch.long),
     )
  
  
-def load_graphs_from_dir(graphs_dir: str) -> List[Tuple[str, Data]]:
-    """
-    Load all .dot/.xml files from a directory.
-    Returns list of (filename, Data) pairs.
-    """
-    results = []
-    for fname in sorted(os.listdir(graphs_dir)):
-        if "Zone.Identifier" in fname or fname.startswith("_program"):
-            continue
-        if not (fname.endswith(".dot") or fname.endswith(".xml")):
-            continue
-        fpath = osp.join(graphs_dir, fname)
-        try:
-            G = _load_graph_from_file(fpath)
-            data = nx_graph_to_pyg(G)
-            if data is not None:
-                results.append((fname, data))
-        except Exception as e:
-            log.warning(f"Skipped {fname}: {e}")
-    return results
+def nx_to_pyg(G: nx.MultiDiGraph, label: int) -> Optional[Data]:
+    if G.number_of_nodes() == 0:
+        return None
+    node2id               = {n: i for i, n in enumerate(G.nodes())}
+    x                     = _encode_nodes(G, node2id)
+    edge_index, edge_attr = _encode_edges(G, node2id)
+    if edge_index is None:
+        return None
+    return Data(
+        x=x, edge_index=edge_index, edge_attr=edge_attr,
+        num_nodes=len(node2id),
+        y=torch.tensor([label], dtype=torch.long),
+    )
  
-
-# =========================
-# Label map builder (for JSLibs)
-# =========================
-def build_label_map(split_json: str) -> Dict[int, str]:
-    """
-    Reproduces the lib_to_idx mapping from JSLibsDataset.process().
-    Returns idx → lib_name dict.
-    """
-    with open(split_json) as f:
-        lib_split = json.load(f)
-    all_libs = sorted(lib_split.keys())
-    return {i: lib for i, lib in enumerate(all_libs)}
-
-
-# =========================
-# Dataset Loader
  
-# datasets/JSLibs/
-#  ├── raw/
-#  └── processed/
-#       ├── data.pt
-#       └── split_dict.pt
+# =============================================================================
+# Bundler dir helpers
+# =============================================================================
  
-# =========================
+def _split_bundler_ver(bundler_ver: str) -> Tuple[str, str]:
+    if "@" in bundler_ver:
+        name, ver = bundler_ver.split("@", 1)
+        return name, ver
+    return bundler_ver, ""
+ 
+ 
+def _graph_files(graphs_dir: str) -> List[str]:
+    return sorted(
+        f for f in os.listdir(graphs_dir)
+        if (f.endswith((".dot", ".xml"))
+            and "Zone.Identifier" not in f
+            and not f.startswith("_program"))
+    )
+ 
+ 
+# =============================================================================
+# Dataset
+# =============================================================================
+ 
 class JSLibsDataset(InMemoryDataset):
+    """
+    Graph-classification dataset for JS library fingerprinting.
+ 
+    Reads split.json and auto-detects whether it is closed-set or open-set
+    format (see module docstring).  No code change needed when switching modes —
+    just regenerate split.json with build_split.py --mode closed|open.
+    """
  
     def __init__(
         self,
         root: str,
-        split_path: Optional[str] = None,
-        min_nodes: int = 5,
-        max_nodes: int = 1000,
-        transform: Optional[Callable] = None,
-        pre_transform: Optional[Callable] = None,
-        pre_filter: Optional[Callable] = None,
+        split_path: Optional[str]          = None,
+        min_nodes: int                     = 5,
+        max_nodes: int                     = 2000,
+        max_graphs_per_bundler: Optional[int] = None,
+        transform: Optional[Callable]      = None,
+        pre_transform: Optional[Callable]  = None,
+        pre_filter: Optional[Callable]     = None,
     ):
-        self.split_path = split_path or osp.join(root, 'raw', 'split.json')
-        self.min_nodes = min_nodes
-        self.max_nodes = max_nodes
- 
+        self.split_path             = split_path or osp.join(root, "raw", "split.json")
+        self.min_nodes              = min_nodes
+        self.max_nodes              = max_nodes
+        self.max_graphs_per_bundler = max_graphs_per_bundler
         super().__init__(root, transform, pre_transform, pre_filter)
-        self.data, self.slices = torch.load(self.processed_paths[0],
-                                            weights_only=False)
+        self.data, self.slices = torch.load(
+            self.processed_paths[0], weights_only=False
+        )
  
     @property
-    def raw_dir(self):
-        return osp.join(self.root, 'raw')
+    def raw_dir(self):       return osp.join(self.root, "raw")
+    @property
+    def processed_dir(self): return osp.join(self.root, "processed")
+    @property
+    def raw_file_names(self): return ["split.json"]
+    @property
+    def processed_file_names(self): return ["data.pt", "split_dict.pt"]
  
     @property
-    def processed_dir(self):
-        return osp.join(self.root, 'processed')
- 
-    @property
-    def raw_file_names(self):
-        return ['split.json']
- 
-    @property
-    def processed_file_names(self):
-        return ['data.pt', 'split_dict.pt']
-   
-    @property
-    def num_classes(self):
-        if hasattr(self.data, 'y') and self.data.y is not None:
-            return int(self.data.y.max().item() + 1)
-        return 0
+    def num_classes(self) -> int:
+        return int(self.data.y.max().item()) + 1 if self.data.y is not None else 0
  
     def download(self):
         pass
  
+    # ------------------------------------------------------------------ #
+    #  process                                                             #
+    # ------------------------------------------------------------------ #
+ 
     def process(self):
-        data_list = []
-        split_dict = {'train': [], 'valid': [], 'test': []}
- 
-        # ---- Load split ----
         with open(self.split_path) as f:
-            lib_split = json.load(f)
+            lib_split: Dict = json.load(f)
  
-        all_libs = sorted(lib_split.keys())
+        # normalise "valid" → "val"
+        lib_split = {
+            k: ({gk: ("val" if gv == "valid" else gv) for gk, gv in v.items()}
+                if isinstance(v, dict)
+                else ("val" if v == "valid" else v))
+            for k, v in lib_split.items()
+        }
+ 
+        mode = detect_split_mode(lib_split)
+        log.info("Split mode detected: %s", mode)
+        print(f"Split mode: {mode}")
+ 
+        # label space — sorted lib@ver keys, same order as split.json keys
+        all_libs   = sorted(lib_split.keys())
         lib_to_idx = {lib: i for i, lib in enumerate(all_libs)}
  
-        skipped = 0
+        # Canonical split keys — always "train" / "val" / "test"
+        VALID_SPLITS = {"train", "val", "test"}
  
-        for lib in os.listdir(self.raw_dir):
-            lib_dir = osp.join(self.raw_dir, lib)
-            if not osp.isdir(lib_dir) or lib not in lib_split:
+        data_list: List[Data] = []
+        split_dict            = {"train": [], "val": [], "test": []}
+        stats = {"loaded": 0, "skip_parse": 0, "skip_size": 0,
+                 "skip_empty": 0, "skip_not_in_split": 0}
+ 
+        for lib_ver in sorted(os.listdir(self.raw_dir)):
+            lib_dir = osp.join(self.raw_dir, lib_ver)
+            if not osp.isdir(lib_dir):
+                continue
+            if lib_ver not in lib_split:
+                stats["skip_not_in_split"] += 1
                 continue
  
-            split = lib_split[lib]
-            split_key = 'valid' if split == 'val' else split
-            lib_idx = lib_to_idx[lib]
+            lib_idx    = lib_to_idx[lib_ver]
+            lib_info   = lib_split[lib_ver]   # str or dict depending on mode
  
-            for bundler in os.listdir(lib_dir):
-                # skip non-directory files
-                if not osp.isdir( osp.join(lib_dir, bundler)):
-                    continue
- 
-                bundler_dir = osp.join(lib_dir, bundler)
-                graphs_dir = osp.join(bundler_dir, 'graphs')
- 
+            for bundler_ver in sorted(os.listdir(lib_dir)):
+                bundler_dir = osp.join(lib_dir, bundler_ver)
+                if not osp.isdir(bundler_dir):
+                    continue           # skip bundle.js, build.log, etc.
+                graphs_dir = osp.join(bundler_dir, "graphs")
                 if not osp.isdir(graphs_dir):
                     continue
  
-                for fname in os.listdir(graphs_dir)[:10]: # for testing, only load x graphs per bundler
-                    # skip Windows artifact
-                    if "Zone.Identifier" in fname:
-                        continue
-                    # skip _program.dot
-                    if fname.startswith("_program"):
+                bundler_name, bundler_version = _split_bundler_ver(bundler_ver)
+                fnames = _graph_files(graphs_dir)
+                if self.max_graphs_per_bundler is not None:
+                    fnames = fnames[: self.max_graphs_per_bundler]
+ 
+                for fname in fnames:
+ 
+                    # ---- resolve & normalise split key for this graph ----
+                    if mode == "closed":
+                        graph_key = f"{bundler_ver}/graphs/{fname}"
+                        if graph_key not in lib_info:
+                            continue   # graph not listed in split.json
+                        split_key = lib_info[graph_key]
+                    else:
+                        split_key = lib_info   # plain string from split.json
+ 
+                    # Always use 'val' (never 'valid') — guard bad values too
+                    split_key = "val" if split_key == "valid" else split_key
+                    if split_key not in VALID_SPLITS:
+                        log.warning("Unknown split value %r for %s/%s -- skipping",
+                                    split_key, lib_ver, fname)
                         continue
  
+                    # ---- parse ----
                     fpath = osp.join(graphs_dir, fname)
- 
                     try:
-                        if fname.endswith(".dot"):
-                            G = read_dot_safe(fpath)
-                        elif fname.endswith(".xml"):
-                            G = read_xml_safe(fpath)
-                        else:
-                            skipped += 1
-                            continue
-                    except Exception as e:
-                        skipped += 1
+                        G = load_graph(fpath)
+                    except Exception as exc:
+                        log.warning("Parse error %s/%s/%s: %s",
+                                    lib_ver, bundler_ver, fname, exc)
+                        stats["skip_parse"] += 1
                         continue
  
-                    node2id = {n: i for i, n in enumerate(G.nodes())}
+                    # ---- size filter ----
+                    n = G.number_of_nodes()
+                    if n < self.min_nodes or n > self.max_nodes:
+                        stats["skip_size"] += 1
+                        continue
  
-                    # ---- Node features (HASH, không vocab) ----
-                    dim = 128
-                    x = torch.zeros((len(node2id), dim))
+                    # ---- convert ----
+                    data = nx_to_pyg(G, lib_idx)
+                    if data is None:
+                        stats["skip_empty"] += 1
+                        continue
  
-                    for node, attr in G.nodes(data=True):
-                        idx = node2id[node]
-                        label = attr.get("label", "UNK")
-                        h = hash(label) % dim
-                        x[idx][h] = 1
+                    # ---- metadata ----
+                    data.lib_ver       = lib_ver
+                    data.bundler_name  = bundler_name
+                    data.bundler_ver   = bundler_version
+                    data.graph_id      = fname
+                    data.split         = split_key   # convenient for analysis
  
-                    # ---- Edges ----
-                    # edge_index = []
-                    # edge_attr = []
- 
-                    # for u, v, attr in G.edges(data=True):
-                    #     edge_index.append([node2id[u], node2id[v]])
- 
-                    #     etype = attr.get("label", "AST")
-                    #     edge_attr.append(EDGE_TYPE_MAP.get(etype, 0))
- 
-                    # if len(edge_index) == 0:
-                    #     skipped += 1
-                    #     continue
- 
-                    # edge_index = torch.tensor(edge_index).t().contiguous()
-                    # edge_attr = torch.tensor(edge_attr).view(-1, 1)
- 
-                    edge_index, edge_attr = encode_edges_grouped(G, node2id)
- 
-                    data = Data(
-                        x=x,
-                        edge_index=edge_index,
-                        edge_attr=edge_attr,
-                        num_nodes=len(node2id),
-                        y=torch.tensor([lib_idx])
-                    )
- 
-                    # ---- Metadata ----
-                    data.lib = lib
-                    data.bundler = bundler
-                    data.graph_id = fname
-                    data.y = lib_idx # label = lib index
-                    # data.bundler_id = bundler_idx
- 
+                    graph_idx = len(data_list)
                     data_list.append(data)
-                    idx = len(data_list) - 1
-                    split_dict[split_key].append(idx)
+                    split_dict[split_key].append(graph_idx)
+                    stats["loaded"] += 1
  
-                    print(
-                        "Read %10s:%25s with %5s nodes and %5s edges." % 
-                        (lib, fname, G.number_of_nodes(), G.number_of_edges())
-                    )
+        # ---- report ----
+        print(
+            f"Loaded {stats['loaded']} graphs  "
+            f"(train={len(split_dict['train'])}  "
+            f"val={len(split_dict['val'])}  "
+            f"test={len(split_dict['test'])})  "
+            f"skipped: parse={stats['skip_parse']}  "
+            f"size={stats['skip_size']}  "
+            f"empty={stats['skip_empty']}"
+        )
  
-        print(f"Loaded {len(data_list)} graphs, skipped {skipped}")
+        if not data_list:
+            raise RuntimeError(
+                "No graphs loaded. Check:\n"
+                "  1. raw/ contains lib@ver/ subdirectories\n"
+                "  2. split.json keys match directory names exactly\n"
+                "  3. graphs/ subdirectories contain .xml / .dot files\n"
+                f"  4. Split mode detected as '{mode}' — "
+                "verify split.json schema matches"
+            )
  
-        if len(data_list) == 0:
-            raise RuntimeError("No graphs loaded")
- 
-        if self.pre_filter:
+        if self.pre_filter is not None:
             data_list = [d for d in data_list if self.pre_filter(d)]
- 
-        if self.pre_transform:
+        if self.pre_transform is not None:
             data_list = [self.pre_transform(d) for d in data_list]
  
         torch.save(self.collate(data_list), self.processed_paths[0])
-        torch.save(split_dict, self.processed_paths[1])
+        torch.save(split_dict,              self.processed_paths[1])
+ 
+    # ------------------------------------------------------------------ #
+ 
+    def get_idx_split(self) -> Dict[str, List[int]]:
+        """
+        Returns {"train": [...], "val": [...], "test": [...]}.
+        Always uses 'val' (never 'valid') — safe to call on old processed files.
+        """
+        d = torch.load(self.processed_paths[1], weights_only=False)
+        # backward-compat: rename 'valid' key if an old processed file exists
+        if "valid" in d and "val" not in d:
+            d["val"] = d.pop("valid")
+        elif "valid" in d and "val" in d:
+            d["val"] = d["val"] + d.pop("valid")
+        # ensure all three keys always present
+        for k in ("train", "val", "test"):
+            d.setdefault(k, [])
+        return d
+ 
+    def __repr__(self) -> str:
+        return f"JSLibsDataset(graphs={len(self)}, classes={self.num_classes})"
  
  
-    def get_idx_split(self):
-        return torch.load(self.processed_paths[1], weights_only=False)
+# =============================================================================
+# Label map  (inference helper)
+# =============================================================================
  
-    def __repr__(self):
-        return f"JSLibDataset(graphs={len(self)})"''
- 
- 
-if __name__ == '__main__':
-    dataset = JSLibsDataset(root='datasets/JSLibs')
-    # print(dataset)
-    # print(dataset[0])
-    # print(dataset[0].x)
-    # print(dataset[0].edge_index)
-    # print(dataset[0].edge_attr)
-    # print(dataset.get_idx_split())
+def build_label_map(split_json: str) -> Dict[int, str]:
+    """idx → lib@ver  (mirrors JSLibsDataset.process() ordering)."""
+    with open(split_json) as f:
+        lib_split = json.load(f)
+    return {i: lib for i, lib in enumerate(sorted(lib_split.keys()))}
 
+
+# =============================================================================
+# Test / debug
+# =============================================================================
+
+if __name__ == "__main__":
+    import pprint
     from collections import Counter
 
+    ROOT = "datasets/JSLibs"
+
+    print("=" * 60)
+    print("Loading dataset...")
+    print("=" * 60)
+
+    dataset = JSLibsDataset(
+        root=ROOT,
+        split_path=osp.join(ROOT, "raw", "split.json"),
+        max_graphs_per_bundler=10  # keep small for debugging
+    )
+
+    print("\nDataset loaded:")
+    print(dataset)
+    print(f"Total graphs: {len(dataset)}")
+    print(f"Num classes: {dataset.num_classes}")
+
+    print("\n" + "=" * 60)
+    print("Checking splits...")
+    print("=" * 60)
+
     split = dataset.get_idx_split()
+    pprint.pprint(split)
 
     def check_split(name, idxs):
-        ys = [dataset[i].y.item() for i in idxs]
-        print(f"{name} size:", len(idxs))
-        print(f"{name} label dist:", Counter(ys))
+        print(f"\n--- {name.upper()} ---")
+        print(f"Size: {len(idxs)}")
 
-    check_split("Train", split['train'])
-    check_split("Valid", split['valid'])
-    check_split("Test", split['test'])
- 
+        if len(idxs) == 0:
+            print("⚠️  EMPTY SPLIT (this will crash training!)")
+            return
+
+        ys = [dataset[i].y.item() for i in idxs]
+        print("Label distribution:", Counter(ys))
+
+    check_split("train", split["train"])
+    check_split("val", split['val'])
+    check_split("test", split["test"])
+
+    print("\n" + "=" * 60)
+    print("Inspecting sample graph...")
+    print("=" * 60)
+
+    data = dataset[0]
+
+    print("Graph info:")
+    print(f"- num_nodes: {data.num_nodes}")
+    print(f"- num_edges: {data.edge_index.shape[1]}")
+    print(f"- node_feat_dim: {data.x.shape}")
+    print(f"- edge_attr shape: {data.edge_attr.shape}")
+
+    print("\nNode feature sample (non-zero indices):")
+    nz = (data.x[0] > 0).nonzero(as_tuple=True)[0]
+    print(nz[:10])
+
+    print("\nEdge attr sample (first 10):")
+    print(data.edge_attr[:10])
+
+    print("\nUnique edge groups:")
+    print(set(data.edge_attr[:, 0].tolist()))
+
+    print("\nDirection distribution:")
+    print(Counter(data.edge_attr[:, 1].tolist()))
+
+    print("\n" + "=" * 60)
+    print("Sanity checks")
+    print("=" * 60)
+
+    assert len(split["train"]) > 0, "Train split is empty!"
+    assert len(split["val"]) > 0, "Val split is empty!"
+    assert len(split["test"]) > 0, "Test split is empty!"
+
+    print("✅ All sanity checks passed!")
