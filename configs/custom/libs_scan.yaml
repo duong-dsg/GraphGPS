@@ -1,83 +1,60 @@
 # ================================================================
 # GraphGPS — JS Library Obfuscation Detection
 # Run: python main.py --cfg configs/custom/libs_scan.yaml wandb.use False
-#
-# Adapted from:
-#   - ogbg-code2  (program graph + GatedGCN+Performer)
-#   - malnettiny  (graph classification, small dataset, max pooling)
 # ================================================================
 
 out_dir: results
+metric_best: accuracy-JS   # balanced per-lib recall (works for both multiclass and multilabel)
+metric_agg: argmax
+name_tag: v3
 
-# metric_best phải là tên metric mà logger trả về.
-# Với task_type: classification → logger tính 'accuracy' và 'f1'.
-# Dùng 'accuracy' để ckpt_best hoạt động đúng.
-# (NT-Xent loss được tính riêng trong custom train loop)
-metric_best: accuracy
-
-# name_tag → xuất hiện trong tên folder output và wandb run name
-# Ví dụ: results/libs_scan-v1/0/
-name_tag: v1
-
-# wandb tắt khi chạy CLI: wandb.use False
 wandb:
-  use: True
+  use: False   # disable until pipeline is validated
   project: js-lib-similarity
 
 # ----------------------------------------------------------------
-# Dataset — custom PyG dataset
+# Dataset
 # ----------------------------------------------------------------
-# format: PyG-<ClassName> → GraphGym sẽ tìm class JSLibDataset
-# trong graphgps/loader/dataset/jslibs.py
-#
-# Cấu trúc thư mục data:
-#   data/jslib/
-#     raw/       ← JS files gốc
-#     processed/ ← PyG Data objects sau khi export từ Joern
-#     split.json ← train/val/test lib split
 dataset:
-  format: PyG-JSLibCPG
-  name: JSLibCPG
+  format: PyG-JSLibs
+  name: JSLibs
   task: graph
-  task_type: classification        # placeholder — loss thật là NT-Xent
+  task_type: classification_multilabel  # ← changed from classification
   transductive: False
   node_encoder: True
-  node_encoder_name: CPGNode+RWSE  # CPGNode features + RWSE encoding
-  node_encoder_bn: True
+  node_encoder_name: CPGNode    # ← removed LapPE until dataset is large enough
+  node_encoder_bn: False        # single encoder, no BN needed
   edge_encoder: True
-  edge_encoder_name: CPGEdge       # 4 edge types: AST/CFG/PDG/CDG
-  edge_encoder_bn: True
-  split_index: 0                   # index trong split list (multi-split mode)
-  split_mode: standard             # dùng split.json đã tạo sẵn
+  edge_encoder_name: CPGEdge
+  edge_encoder_bn: False
+  split_index: 0
+  split_mode: standard
 
 # ----------------------------------------------------------------
-# Positional Encoding — LapPE (global)
+# Positional Encoding — LapPE
 # ----------------------------------------------------------------
-# Tại sao enable=True (khác code2):
-#   obfuscation không thay đổi cấu trúc graph → LapPE ổn định
-#   LapPE giúp model phân biệt function theo vị trí trong call graph
+# DISABLED: with < 50 graphs per lib, eigenvectors are unstable.
+# Re-enable once you have 200+ graphs per split and ≥ 10 libs.
 posenc_LapPE:
-  enable: True
+  enable: False
   eigen:
-    laplacian_norm: none           # none vì graph có hướng (directed CPG)
+    laplacian_norm: none
     eigvec_norm: L2
-    max_freqs: 8                   # giảm từ 10 (code2) vì graph nhỏ hơn
+    max_freqs: 8
   model: DeepSet
   dim_pe: 16
-  layers: 2                        # giảm từ 3 (code2), tránh overfit
+  layers: 2
   n_heads: 4
   raw_norm_type: none
 
 # ----------------------------------------------------------------
-# Structural Encoding — RWSE (local)
+# Structural Encoding — RWSE
 # ----------------------------------------------------------------
-# Tại sao thêm RWSE (không có trong code2 và malnettiny):
-#   M^k[v,v] bắt được loop/branch patterns
-#   obfuscation không xóa được CFG back-edges → RWSE rất ổn định
+# Keep enabled: loop/branch patterns are stable and cheap to compute.
 posenc_RWSE:
   enable: True
   kernel:
-    times: [1, 2, 4, 8, 16]       # 5 steps → dim_pe=5 (auto)
+    times: [1, 2, 4, 8, 16]
   model: Linear
   dim_pe: 16
   raw_norm_type: none
@@ -86,39 +63,32 @@ posenc_RWSE:
 # Training
 # ----------------------------------------------------------------
 train:
-  mode: custom                     # dùng custom_train.py, không phải Lightning
-  batch_size: 16                   # giảm từ 32 (code2), dataset nhỏ
-  eval_period: 1                   # eval mỗi epoch
-  ckpt_period: 100                 # backup checkpoint mỗi 100 epoch
+  mode: custom
+  batch_size: 8         # ← smaller: avoids padding waste with tiny graphs
+  eval_period: 1
+  ckpt_period: 100
   enable_ckpt: True
-  ckpt_best: True                  # chỉ giữ best model theo metric_best
-  auto_resume: False               # True nếu muốn resume từ checkpoint cũ
-  batch_accumulation: 1            # gradient accumulation (1 = không accumulate)
+  ckpt_best: True
 
 # ----------------------------------------------------------------
 # Model
 # ----------------------------------------------------------------
 model:
   type: GPSModel
-  loss_fun: cross_entropy          # placeholder cho GraphGym logger
-                                   # NT-Xent được compute trong train loop
+  loss_fun: cross_entropy    # GraphGym maps this to BCEWithLogitsLoss for multilabel
   edge_decoding: dot
-  graph_pooling: max               # max thay vì mean (malnettiny cũng dùng max)
-                                   # lý do: chỉ cần 1 function match để detect lib
+  graph_pooling: max
 
 # ----------------------------------------------------------------
-# GPS Transformer layers
+# GPS layers
 # ----------------------------------------------------------------
-# CustomGatedGCN: xử lý edge features (AST/CFG/PDG/CDG type)
-# Performer:      linear O(N) attention — scale được với graph lớn
 gt:
   layer_type: CustomGatedGCN+Performer
-  layers: 4                        # giữ từ code2
-  n_heads: 4                       # giữ từ code2
-  dim_hidden: 128                  # giảm từ 256 (code2) vì dataset nhỏ
-                                   # PHẢI match gnn.dim_inner
-  dropout: 0.1                     # giảm từ 0.2 (code2)
-  attn_dropout: 0.3                # giảm từ 0.5 (code2)
+  layers: 3             # ← reduced from 4: less overfitting risk with small data
+  n_heads: 4
+  dim_hidden: 64        # ← reduced from 128: fewer params for tiny dataset
+  dropout: 0.1
+  attn_dropout: 0.5
   layer_norm: False
   batch_norm: True
 
@@ -126,15 +96,14 @@ gt:
 # GNN head
 # ----------------------------------------------------------------
 gnn:
-  head: default                    # dùng default graph head (như malnettiny)
-                                   # output: [B, num_classes] — bị bỏ qua khi dùng NT-Xent
+  head: default
   layers_pre_mp: 0
-  layers_post_mp: 2                # 2 linear layers sau GPS: 128→128→num_classes
-  dim_inner: 128                   # PHẢI match gt.dim_hidden
+  layers_post_mp: 2
+  dim_inner: 64         # ← MUST match gt.dim_hidden
   batchnorm: True
   act: relu
   dropout: 0.0
-  agg: max                         # match graph_pooling
+  agg: max
   normalize_adj: False
 
 # ----------------------------------------------------------------
@@ -142,17 +111,15 @@ gnn:
 # ----------------------------------------------------------------
 optim:
   clip_grad_norm: True
-  clip_grad_norm_value: 1.0        # giá trị clip (default trong custom_train)
   optimizer: adamW
   weight_decay: 1e-5
-  base_lr: 0.0001                  # giữ từ code2 (thấp hơn malnettiny 0.0005)
-  max_epoch: 50                    # tăng từ 30 (code2), dataset nhỏ cần nhiều epoch
+  base_lr: 0.001        # ← increased from 0.0002: warmup was masking the dead lr
+  max_epoch: 200        # ← more epochs to compensate for fewer graphs
   scheduler: cosine_with_warmup
-  num_warmup_epochs: 5             # ~10% của max_epoch
-  # Các fields sau cần có để tránh KeyError trong ExtendedSchedulerConfig
-  steps: [30, 40]                  # dùng cho scheduler='step' — bỏ qua với cosine
+  num_warmup_epochs: 2  # ← reduced from 8: 8 epochs of lr=0 killed early training
+  steps: [120, 160]
   lr_decay: 0.1
   reduce_factor: 0.5
   schedule_patience: 10
   min_lr: 1e-6
-  momentum: 0.9                    # dùng cho SGD — bỏ qua với adamW
+  momentum: 0.9
