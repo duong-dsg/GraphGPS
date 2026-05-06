@@ -247,112 +247,42 @@ class CustomLogger(Logger):
         return res
 
     def classification_multilabel(self):
-        # ── 1. Reconstruct [N, C] tensors from per-batch list ──────────────
-        # self._true / self._pred hold one [B, C] tensor per batch.
-        # Last batch is smaller → torch.stack fails; torch.cat(dim=0) is safe.
-        true       = torch.cat(self._true, dim=0)   # [N, C] float
-        pred_score = torch.cat(self._pred, dim=0)   # [N, C] float (logits)
+        true, pred_score = torch.cat(self._true), torch.cat(self._pred)
+        reformat = lambda x: round(float(x), cfg.round)
 
-        # Defensive reshape if something squeezed a dimension
-        if true.ndim == 1:
-            n_cols     = pred_score.shape[-1] if pred_score.ndim > 1 else 1
-            true       = true.view(-1, n_cols)
-            pred_score = pred_score.view(-1, n_cols)
-
-        reformat   = lambda x: round(float(x), cfg.round)
-        pred_prob  = torch.sigmoid(pred_score)           # [N, C]
-        pred_bin   = (pred_prob > 0.5).long()            # [N, C]
-        true_int   = true.long()                         # [N, C]
-        true_np    = true_int.cpu().numpy()
-        pred_bin_np = pred_bin.cpu().numpy()
-        pred_prob_np = pred_prob.cpu().detach().numpy()
-
-        # ── 2. Core metrics (always computed) ──────────────────────────────
-        acc_m = MetricWrapper(metric='accuracy',
+        # MetricWrapper will remove NaNs and apply the metric to each target dim
+        acc = MetricWrapper(metric='accuracy',
+                            target_nan_mask='ignore-mean-label',
+                            task='binary',
+                            cast_to_int=True)
+        auroc = MetricWrapper(metric='auroc',
                               target_nan_mask='ignore-mean-label',
                               task='binary',
                               cast_to_int=True)
-        auroc_m = MetricWrapper(metric='auroc',
-                                target_nan_mask='ignore-mean-label',
-                                task='binary',
-                                cast_to_int=True)
-
-        from sklearn.metrics import average_precision_score
-        try:
-            ap = reformat(average_precision_score(
-                true_np, pred_prob_np, average='macro'))
-        except Exception:
-            ap = 0.0
-
-        true_gpu = true.to(torch.device(cfg.accelerator))
-        pred_gpu = pred_score.to(torch.device(cfg.accelerator))
-
+        ogb_ap = reformat(metrics_ogb.eval_ap(true.cpu().numpy(),
+                                              pred_score.cpu().numpy())['ap'])
+        # Send to GPU to speed up TorchMetrics if possible.
+        true = true.to(torch.device(cfg.accelerator))
+        pred_score = pred_score.to(torch.device(cfg.accelerator))
         results = {
-            'accuracy'    : reformat(acc_m(torch.sigmoid(pred_gpu), true_gpu)),
-            'auc'         : reformat(auroc_m(pred_gpu, true_gpu)),
-            'ap'          : ap,
-            'f1_macro'    : reformat(f1_score(true_np, pred_bin_np,
-                                              average='macro',
-                                              zero_division=0)),
-            'f1_weighted' : reformat(f1_score(true_np, pred_bin_np,
-                                              average='weighted',
-                                              zero_division=0)),
+            'accuracy': reformat(acc(torch.sigmoid(pred_score), true)),
+            'auc': reformat(auroc(pred_score, true)),
+            'ap': ogb_ap,
         }
 
-        # ── 3. accuracy-JS: balanced per-lib recall ─────────────────────────
-        # For each lib column r: recall[r] = TP[r] / (total positives for r).
-        # Final score = mean over ALL columns (absent libs count as 0),
-        # penalising models that ignore rare libs.
-        if cfg.metric_best == 'accuracy-JS':
-            n_classes  = true_int.shape[1]
-            pr_classes = np.zeros(n_classes)
-            for r in range(n_classes):
-                pos_mask = true_np[:, r] == 1
-                if pos_mask.sum() > 0:
-                    pr_classes[r] = (
-                        (pred_bin_np[:, r] == 1) & pos_mask
-                    ).sum() / float(pos_mask.sum())
-
-            results['accuracy-JS'] = reformat(
-                float(np.sum(pr_classes) / float(n_classes))
-            )
-
-            # Per-lib breakdown — printed to log only, not stored in JSON/wandb
-            label_map = _load_label_map()
-            epoch     = getattr(self, '_epoch', -1)
-            lines = [
-                f"\n{'─' * 60}",
-                f"  Per-lib recall  [{self.name}  epoch {epoch}]",
-                f"{'─' * 60}",
-            ]
-            for r in range(n_classes):
-                pos_mask = true_np[:, r] == 1
-                if pos_mask.sum() == 0:
-                    continue
-                recall_r = pr_classes[r]
-                n_pos    = int(pos_mask.sum())
-                n_hit    = int(((pred_bin_np[:, r] == 1) & pos_mask).sum())
-                name     = label_map[r] if (label_map and r in label_map) else str(r)
-                bar      = '█' * int(recall_r * 30) + '░' * (30 - int(recall_r * 30))
-                lines.append(f"  {name:<30s}  {bar}  {recall_r:5.1%}  ({n_hit}/{n_pos})")
-            lines.append(f"{'─' * 60}\n")
-            logging.info('\n'.join(lines))
-
-        # ── 4. Optional cross-check against OGB evaluator ──────────────────
-        # Only meaningful when metric_best == 'ap' (OGB-style tasks).
-        # Skipped for accuracy-JS to avoid eval_ap crashing on JSLibs labels.
-        if self.test_scores and cfg.metric_best == 'ap':
+        if self.test_scores:
+            true = true.cpu().numpy()
+            pred_score = pred_score.cpu().numpy()
             ogb = {
                 'accuracy': reformat(metrics_ogb.eval_acc(
-                    true_np, pred_bin_np)['acc']),
-                'ap'      : reformat(metrics_ogb.eval_ap(
-                    true_np, pred_prob_np)['ap']),
-                'auc'     : reformat(metrics_ogb.eval_rocauc(
-                    true_np, pred_prob_np)['rocauc']),
+                    true, (pred_score > 0.).astype(int))['acc']),
+                'ap': reformat(metrics_ogb.eval_ap(true, pred_score)['ap']),
+                'auc': reformat(
+                    metrics_ogb.eval_rocauc(true, pred_score)['rocauc']),
             }
             assert np.isclose(ogb['accuracy'], results['accuracy'], atol=1e-05)
-            assert np.isclose(ogb['ap'],       results['ap'],       atol=1e-05)
-            assert np.isclose(ogb['auc'],      results['auc'],      atol=1e-05)
+            assert np.isclose(ogb['ap'], results['ap'], atol=1e-05)
+            assert np.isclose(ogb['auc'], results['auc'], atol=1e-05)
 
         return results
 
@@ -405,13 +335,6 @@ class CustomLogger(Logger):
         else:
             assert true.shape[0] == pred.shape[0]
             batch_size = true.shape[0]
-
-        # Multilabel: true is [B, C] float from the dataloader (y stored as
-        # [1, C] per graph, collated to [N, C], sliced to [B, C] per batch).
-        # Guard: if somehow squeezed to 1-D for a single-graph batch, restore.
-        if isinstance(true, torch.Tensor) and true.ndim == 1 and \
-                isinstance(pred, torch.Tensor) and pred.ndim == 2:
-            true = true.unsqueeze(0)  # [C] → [1, C]
 
         self._iter += 1
         self._true.append(true)

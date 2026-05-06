@@ -24,7 +24,7 @@ import json
 import logging
 import os
 import os.path as osp
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple
 
 import networkx as nx
 import pydot
@@ -186,14 +186,10 @@ def _encode_edges(
 
 def nx_to_pyg(
     G: nx.MultiDiGraph,
-    label: Union[int, torch.Tensor],
+    label: int,
     vocab: Optional[Dict[str, int]] = None,
 ) -> Optional[Data]:
-    """
-    label can be:
-      int              → multiclass: stored as torch.long [1]
-      torch.Tensor [C] → multilabel: stored as torch.float [C]  (binary vector)
-    """
+    """Convert nx.MultiDiGraph → PyG Data with a single integer class label."""
     if G.number_of_nodes() == 0:
         return None
     node2id               = {n: i for i, n in enumerate(G.nodes())}
@@ -201,18 +197,10 @@ def nx_to_pyg(
     edge_index, edge_attr = _encode_edges(G, node2id)
     if edge_index is None:
         return None
-    if isinstance(label, torch.Tensor):
-        # Shape [1, C] — the leading 1 is the graph dimension.
-        # InMemoryDataset.collate() uses torch.cat on y across all graphs,
-        # so [1, C] * N graphs → [N, C] correctly.
-        # If stored as flat [C], cat gives [N*C] which breaks the logger.
-        y = label.float().unsqueeze(0)             # [1, C] float for BCE
-    else:
-        y = torch.tensor([label], dtype=torch.long)  # [1] long for CE
     return Data(
         x=x, edge_index=edge_index, edge_attr=edge_attr,
         num_nodes=len(node2id),
-        y=y,
+        y=torch.tensor([label], dtype=torch.long),   # [1] long
     )
 
 
@@ -253,7 +241,6 @@ class JSLibsDataset(InMemoryDataset):
         self,
         root: str,
         split_path: Optional[str]          = None,
-        task: str                          = 'multiclass',  # 'multiclass' | 'multilabel'
         min_nodes: int                     = 5,
         max_nodes: int                     = 2000,
         max_graphs_per_bundler: Optional[int] = None,
@@ -261,9 +248,6 @@ class JSLibsDataset(InMemoryDataset):
         pre_transform: Optional[Callable]  = None,
         pre_filter: Optional[Callable]     = None,
     ):
-        assert task in ('multiclass', 'multilabel'), \
-            f"task must be 'multiclass' or 'multilabel', got {task!r}"
-        self.task                   = task
         self.split_path             = split_path or osp.join(root, "raw", "split.json")
         self.min_nodes              = min_nodes
         self.max_nodes              = max_nodes
@@ -273,14 +257,6 @@ class JSLibsDataset(InMemoryDataset):
             self.processed_paths[0], weights_only=False
         )
 
-        # ---- shape assertion: catch stale processed/ cache ----
-        if self.task == 'multilabel' and self.data.y is not None:
-            assert self.data.y.ndim == 2, (
-                f"Stale processed cache detected: data.y shape is "
-                f"{tuple(self.data.y.shape)} but expected 2D [N, C] for "
-                f"multilabel.\n"
-                f"Fix: rm -rf {self.processed_dir} then re-run."
-            )
 
     @property
     def raw_dir(self):       return osp.join(self.root, "raw")
@@ -295,8 +271,6 @@ class JSLibsDataset(InMemoryDataset):
     def num_classes(self) -> int:
         if self.data.y is None:
             return 0
-        if self.task == 'multilabel':
-            return self.data.y.shape[-1]   # C binary columns
         return int(self.data.y.max().item()) + 1
 
     def download(self):
@@ -406,18 +380,8 @@ class JSLibsDataset(InMemoryDataset):
                         stats["skip_size"] += 1
                         continue
 
-                    # ---- build label ----
-                    # multiclass : integer index  → y = [lib_idx]  (long)
-                    # multilabel : binary vector  → y = [0,1,0,...]  (float)
-                    if self.task == 'multilabel':
-                        label_vec = torch.zeros(len(all_libs), dtype=torch.float)
-                        label_vec[lib_idx] = 1.0
-                        label = label_vec
-                    else:
-                        label = lib_idx
-
                     # ---- convert ----
-                    data = nx_to_pyg(G, label, vocab=vocab)
+                    data = nx_to_pyg(G, lib_idx, vocab=vocab)
                     if data is None:
                         stats["skip_empty"] += 1
                         continue

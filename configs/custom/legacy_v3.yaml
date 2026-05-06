@@ -19,7 +19,7 @@ dataset:
   format: PyG-JSLibs
   name: JSLibs
   task: graph
-  task_type: classification_multilabel  # ← changed from classification
+  task_type: classification # ← changed from classification
   transductive: False
   node_encoder: True
   node_encoder_name: CPGNode    # ← removed LapPE until dataset is large enough
