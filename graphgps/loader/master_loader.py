@@ -644,8 +644,9 @@ def join_dataset_splits(datasets):
     return datasets[0]
 
 
- 
-
+# =========================
+# Custom dataset loaders for datasets that require special handling
+# =========================
 def preformat_JSLibs(dataset_dir, name):
     """
     Load JS Libraries dataset (Joern → PyG → GraphGPS-ready)
@@ -664,12 +665,12 @@ def preformat_JSLibs(dataset_dir, name):
     split_dict = dataset.get_idx_split()
     dataset.split_idxs = [
         split_dict['train'],
-        split_dict['valid'],
+        split_dict['val'],
         split_dict['test']
     ]
     logging.info(
         f"Splits: train={len(split_dict['train'])}, "
-        f"val={len(split_dict['valid'])}, "
+        f"val={len(split_dict['val'])}, "
         f"test={len(split_dict['test'])}"
     )
     # =========================

@@ -9,7 +9,7 @@ scripts/pcqm4m/**/*.gz
 scripts/pcqm4m/**/*.tsv
 scripts/pcqm4m/pcqm4m-v2/
 slurm_history/
-datasets/
+# datasets/
 pretrained/
 results/
 vocprep/benchmark_RELEASE/

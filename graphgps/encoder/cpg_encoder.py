@@ -36,21 +36,37 @@ NODE_FEATURE_DIM = 128
 
 @register_node_encoder("CPGNode")
 class CPGNodeEncoder(nn.Module):
+    """
+    Dual-mode node encoder:
+      vocab mode : batch.x [N,1] long  -> nn.Embedding(vocab_size, emb_dim)
+      hash mode  : batch.x [N,128] float -> nn.Linear(128, emb_dim)
+    Set cfg.dataset.node_encoder_vocab_size to vocab size to enable vocab mode.
+    """
     def __init__(self, emb_dim: int):
         super().__init__()
-        self.proj = nn.Linear(NODE_FEATURE_DIM, emb_dim)
+        try:
+            from torch_geometric.graphgym.config import cfg
+            vocab_size = int(getattr(cfg.dataset, "node_encoder_vocab_size", 0))
+        except Exception:
+            vocab_size = 0
+ 
+        self.use_vocab = vocab_size > 0
+        if self.use_vocab:
+            self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
+            nn.init.xavier_uniform_(self.embedding.weight[1:])
+        else:
+            self.proj = nn.Linear(NODE_FEATURE_DIM, emb_dim)
  
     def forward(self, batch):
         if batch.x is None:
             raise ValueError("CPGNodeEncoder: batch.x is None")
-        batch.x = self.proj(batch.x.float())
+        if self.use_vocab:
+            batch.x = self.embedding(batch.x.long()).squeeze(1)
+        else:
+            batch.x = self.proj(batch.x.float())
         return batch
-
-
-# =============================================================================
-# Edge encoder
-# =============================================================================
-
+ 
+ 
 @register_edge_encoder("CPGEdge")
 class CPGEdgeEncoder(nn.Module):
     """

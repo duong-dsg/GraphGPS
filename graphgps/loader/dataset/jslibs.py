@@ -1,8 +1,8 @@
 """
 graphgps/loader/dataset/jslibs.py
- 
+
 Supports two split.json schemas produced by build_split.py:
- 
+
   closed mode  (recommended first):
     {
       "axios@1.7.9": {
@@ -13,33 +13,37 @@ Supports two split.json schemas produced by build_split.py:
     }
     → same lib appears in train + val + test, just different graphs.
     → standard N-class CrossEntropyLoss classifier works correctly.
- 
+
   open mode:
     { "axios@1.7.9": "train", "lodash@4.17.21": "test", ... }
     → each lib is entirely in one split.
     → requires metric learning at inference; softmax head will give ~0% on test.
 """
- 
+
 import json
 import logging
 import os
 import os.path as osp
-from typing import Callable, Dict, List, Optional, Tuple
- 
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
 import networkx as nx
 import pydot
 import torch
 import torch.nn as nn
 import xml.etree.ElementTree as ET
 from torch_geometric.data import Data, InMemoryDataset
- 
+from torch_geometric.graphgym.register import (
+    register_edge_encoder,
+    register_node_encoder,
+)
+
 log = logging.getLogger(__name__)
- 
- 
+
+
 # =============================================================================
 # Constants
 # =============================================================================
- 
+
 EDGE_GROUPS: Dict[str, int] = {
     "AST": 0, "CONTAINS": 0,
     "CFG": 1, "DOMINATE": 1, "POST_DOMINATE": 1,
@@ -50,12 +54,12 @@ EDGE_GROUPS: Dict[str, int] = {
 }
 NUM_EDGE_GROUPS  = len(set(EDGE_GROUPS.values()))   # 6
 NODE_FEATURE_DIM = 128
- 
- 
+
+
 # =============================================================================
 # Split schema detection
 # =============================================================================
- 
+
 def detect_split_mode(lib_split: Dict) -> str:
     """
     Returns "closed" or "open" by inspecting the first value in split.json.
@@ -70,12 +74,12 @@ def detect_split_mode(lib_split: Dict) -> str:
     raise ValueError(
         f"Unrecognised split.json schema — expected str or dict values, got {type(first)}"
     )
- 
- 
+
+
 # =============================================================================
 # Graph I/O
 # =============================================================================
- 
+
 def _read_dot(path: str) -> nx.MultiDiGraph:
     graphs = pydot.graph_from_dot_file(path)
     if not graphs:
@@ -95,8 +99,8 @@ def _read_dot(path: str) -> nx.MultiDiGraph:
         attrs = {k: v.strip('"') for k, v in edge.get_attributes().items()}
         G.add_edge(src, dst, **attrs)
     return G
- 
- 
+
+
 def _read_xml(path: str) -> nx.MultiDiGraph:
     for reader in (nx.read_graphml, nx.read_gexf):
         try:
@@ -124,28 +128,43 @@ def _read_xml(path: str) -> nx.MultiDiGraph:
                 attrs[d.get("key")] = d.text
         G.add_edge(src, dst, **attrs)
     return G
- 
- 
+
+
 def load_graph(path: str) -> nx.MultiDiGraph:
     if path.endswith(".dot"):
         return _read_dot(path)
     if path.endswith(".xml"):
         return _read_xml(path)
     raise ValueError(f"Unsupported extension: {path}")
- 
- 
+
+
 # =============================================================================
 # Feature encoding
 # =============================================================================
- 
-def _encode_nodes(G: nx.MultiDiGraph, node2id: Dict) -> torch.Tensor:
-    x = torch.zeros((len(node2id), NODE_FEATURE_DIM))
-    for node, attr in G.nodes(data=True):
-        h = hash(attr.get("label", "UNK")) % NODE_FEATURE_DIM
-        x[node2id[node]][h] = 1.0
-    return x
- 
- 
+
+def _encode_nodes(
+    G: nx.MultiDiGraph,
+    node2id: Dict,
+    vocab: Optional[Dict[str, int]] = None,
+) -> torch.Tensor:
+    """
+    vocab provided  → returns [N, 1] long tensor (vocab indices, for nn.Embedding)
+    vocab=None      → returns [N, NODE_FEATURE_DIM] float one-hot hash (legacy)
+    """
+    if vocab is not None:
+        indices = [
+            vocab.get(attr.get("label", "UNK"), 0)
+            for node, attr in G.nodes(data=True)
+        ]
+        return torch.tensor(indices, dtype=torch.long).unsqueeze(1)
+    else:
+        x = torch.zeros((len(node2id), NODE_FEATURE_DIM))
+        for node, attr in G.nodes(data=True):
+            h = hash(attr.get("label", "UNK")) % NODE_FEATURE_DIM
+            x[node2id[node]][h] = 1.0
+        return x
+
+
 def _encode_edges(
     G: nx.MultiDiGraph, node2id: Dict
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -163,34 +182,51 @@ def _encode_edges(
         torch.tensor(ei, dtype=torch.long).t().contiguous(),
         torch.tensor(ea, dtype=torch.long),
     )
- 
- 
-def nx_to_pyg(G: nx.MultiDiGraph, label: int) -> Optional[Data]:
+
+
+def nx_to_pyg(
+    G: nx.MultiDiGraph,
+    label: Union[int, torch.Tensor],
+    vocab: Optional[Dict[str, int]] = None,
+) -> Optional[Data]:
+    """
+    label can be:
+      int              → multiclass: stored as torch.long [1]
+      torch.Tensor [C] → multilabel: stored as torch.float [C]  (binary vector)
+    """
     if G.number_of_nodes() == 0:
         return None
     node2id               = {n: i for i, n in enumerate(G.nodes())}
-    x                     = _encode_nodes(G, node2id)
+    x                     = _encode_nodes(G, node2id, vocab=vocab)
     edge_index, edge_attr = _encode_edges(G, node2id)
     if edge_index is None:
         return None
+    if isinstance(label, torch.Tensor):
+        # Shape [1, C] — the leading 1 is the graph dimension.
+        # InMemoryDataset.collate() uses torch.cat on y across all graphs,
+        # so [1, C] * N graphs → [N, C] correctly.
+        # If stored as flat [C], cat gives [N*C] which breaks the logger.
+        y = label.float().unsqueeze(0)             # [1, C] float for BCE
+    else:
+        y = torch.tensor([label], dtype=torch.long)  # [1] long for CE
     return Data(
         x=x, edge_index=edge_index, edge_attr=edge_attr,
         num_nodes=len(node2id),
-        y=torch.tensor([label], dtype=torch.long),
+        y=y,
     )
- 
- 
+
+
 # =============================================================================
 # Bundler dir helpers
 # =============================================================================
- 
+
 def _split_bundler_ver(bundler_ver: str) -> Tuple[str, str]:
     if "@" in bundler_ver:
         name, ver = bundler_ver.split("@", 1)
         return name, ver
     return bundler_ver, ""
- 
- 
+
+
 def _graph_files(graphs_dir: str) -> List[str]:
     return sorted(
         f for f in os.listdir(graphs_dir)
@@ -198,25 +234,26 @@ def _graph_files(graphs_dir: str) -> List[str]:
             and "Zone.Identifier" not in f
             and not f.startswith("_program"))
     )
- 
- 
+
+
 # =============================================================================
 # Dataset
 # =============================================================================
- 
+
 class JSLibsDataset(InMemoryDataset):
     """
     Graph-classification dataset for JS library fingerprinting.
- 
+
     Reads split.json and auto-detects whether it is closed-set or open-set
     format (see module docstring).  No code change needed when switching modes —
     just regenerate split.json with build_split.py --mode closed|open.
     """
- 
+
     def __init__(
         self,
         root: str,
         split_path: Optional[str]          = None,
+        task: str                          = 'multiclass',  # 'multiclass' | 'multilabel'
         min_nodes: int                     = 5,
         max_nodes: int                     = 2000,
         max_graphs_per_bundler: Optional[int] = None,
@@ -224,6 +261,9 @@ class JSLibsDataset(InMemoryDataset):
         pre_transform: Optional[Callable]  = None,
         pre_filter: Optional[Callable]     = None,
     ):
+        assert task in ('multiclass', 'multilabel'), \
+            f"task must be 'multiclass' or 'multilabel', got {task!r}"
+        self.task                   = task
         self.split_path             = split_path or osp.join(root, "raw", "split.json")
         self.min_nodes              = min_nodes
         self.max_nodes              = max_nodes
@@ -232,7 +272,16 @@ class JSLibsDataset(InMemoryDataset):
         self.data, self.slices = torch.load(
             self.processed_paths[0], weights_only=False
         )
- 
+
+        # ---- shape assertion: catch stale processed/ cache ----
+        if self.task == 'multilabel' and self.data.y is not None:
+            assert self.data.y.ndim == 2, (
+                f"Stale processed cache detected: data.y shape is "
+                f"{tuple(self.data.y.shape)} but expected 2D [N, C] for "
+                f"multilabel.\n"
+                f"Fix: rm -rf {self.processed_dir} then re-run."
+            )
+
     @property
     def raw_dir(self):       return osp.join(self.root, "raw")
     @property
@@ -241,22 +290,40 @@ class JSLibsDataset(InMemoryDataset):
     def raw_file_names(self): return ["split.json"]
     @property
     def processed_file_names(self): return ["data.pt", "split_dict.pt"]
- 
+
     @property
     def num_classes(self) -> int:
-        return int(self.data.y.max().item()) + 1 if self.data.y is not None else 0
- 
+        if self.data.y is None:
+            return 0
+        if self.task == 'multilabel':
+            return self.data.y.shape[-1]   # C binary columns
+        return int(self.data.y.max().item()) + 1
+
     def download(self):
         pass
- 
+
     # ------------------------------------------------------------------ #
     #  process                                                             #
     # ------------------------------------------------------------------ #
- 
+
     def process(self):
+        # ---- load vocab if available ----
+        vocab_path = osp.join(self.raw_dir, "cpg_vocab.json")
+        vocab: Optional[Dict[str, int]] = None
+        if osp.exists(vocab_path):
+            with open(vocab_path) as f:
+                vocab = json.load(f)
+            log.info("Loaded CPG vocab: %d entries", len(vocab))
+        else:
+            log.warning(
+                "cpg_vocab.json not found at %s -- using hash node features.\n"
+                "Run: python -m graphgps.loader.dataset.cpg_vocab --raw_dir %s",
+                vocab_path, self.raw_dir,
+            )
+
         with open(self.split_path) as f:
             lib_split: Dict = json.load(f)
- 
+
         # normalise "valid" → "val"
         lib_split = {
             k: ({gk: ("val" if gv == "valid" else gv) for gk, gv in v.items()}
@@ -264,23 +331,23 @@ class JSLibsDataset(InMemoryDataset):
                 else ("val" if v == "valid" else v))
             for k, v in lib_split.items()
         }
- 
+
         mode = detect_split_mode(lib_split)
         log.info("Split mode detected: %s", mode)
         print(f"Split mode: {mode}")
- 
+
         # label space — sorted lib@ver keys, same order as split.json keys
         all_libs   = sorted(lib_split.keys())
         lib_to_idx = {lib: i for i, lib in enumerate(all_libs)}
- 
+
         # Canonical split keys — always "train" / "val" / "test"
         VALID_SPLITS = {"train", "val", "test"}
- 
+
         data_list: List[Data] = []
         split_dict            = {"train": [], "val": [], "test": []}
         stats = {"loaded": 0, "skip_parse": 0, "skip_size": 0,
                  "skip_empty": 0, "skip_not_in_split": 0}
- 
+
         for lib_ver in sorted(os.listdir(self.raw_dir)):
             lib_dir = osp.join(self.raw_dir, lib_ver)
             if not osp.isdir(lib_dir):
@@ -288,10 +355,10 @@ class JSLibsDataset(InMemoryDataset):
             if lib_ver not in lib_split:
                 stats["skip_not_in_split"] += 1
                 continue
- 
+
             lib_idx    = lib_to_idx[lib_ver]
             lib_info   = lib_split[lib_ver]   # str or dict depending on mode
- 
+
             for bundler_ver in sorted(os.listdir(lib_dir)):
                 bundler_dir = osp.join(lib_dir, bundler_ver)
                 if not osp.isdir(bundler_dir):
@@ -299,14 +366,14 @@ class JSLibsDataset(InMemoryDataset):
                 graphs_dir = osp.join(bundler_dir, "graphs")
                 if not osp.isdir(graphs_dir):
                     continue
- 
+
                 bundler_name, bundler_version = _split_bundler_ver(bundler_ver)
                 fnames = _graph_files(graphs_dir)
                 if self.max_graphs_per_bundler is not None:
                     fnames = fnames[: self.max_graphs_per_bundler]
- 
+
                 for fname in fnames:
- 
+
                     # ---- resolve & normalise split key for this graph ----
                     if mode == "closed":
                         graph_key = f"{bundler_ver}/graphs/{fname}"
@@ -315,14 +382,14 @@ class JSLibsDataset(InMemoryDataset):
                         split_key = lib_info[graph_key]
                     else:
                         split_key = lib_info   # plain string from split.json
- 
+
                     # Always use 'val' (never 'valid') — guard bad values too
                     split_key = "val" if split_key == "valid" else split_key
                     if split_key not in VALID_SPLITS:
                         log.warning("Unknown split value %r for %s/%s -- skipping",
                                     split_key, lib_ver, fname)
                         continue
- 
+
                     # ---- parse ----
                     fpath = osp.join(graphs_dir, fname)
                     try:
@@ -332,31 +399,41 @@ class JSLibsDataset(InMemoryDataset):
                                     lib_ver, bundler_ver, fname, exc)
                         stats["skip_parse"] += 1
                         continue
- 
+
                     # ---- size filter ----
                     n = G.number_of_nodes()
                     if n < self.min_nodes or n > self.max_nodes:
                         stats["skip_size"] += 1
                         continue
- 
+
+                    # ---- build label ----
+                    # multiclass : integer index  → y = [lib_idx]  (long)
+                    # multilabel : binary vector  → y = [0,1,0,...]  (float)
+                    if self.task == 'multilabel':
+                        label_vec = torch.zeros(len(all_libs), dtype=torch.float)
+                        label_vec[lib_idx] = 1.0
+                        label = label_vec
+                    else:
+                        label = lib_idx
+
                     # ---- convert ----
-                    data = nx_to_pyg(G, lib_idx)
+                    data = nx_to_pyg(G, label, vocab=vocab)
                     if data is None:
                         stats["skip_empty"] += 1
                         continue
- 
+
                     # ---- metadata ----
                     data.lib_ver       = lib_ver
                     data.bundler_name  = bundler_name
                     data.bundler_ver   = bundler_version
                     data.graph_id      = fname
                     data.split         = split_key   # convenient for analysis
- 
+
                     graph_idx = len(data_list)
                     data_list.append(data)
                     split_dict[split_key].append(graph_idx)
                     stats["loaded"] += 1
- 
+
         # ---- report ----
         print(
             f"Loaded {stats['loaded']} graphs  "
@@ -367,7 +444,7 @@ class JSLibsDataset(InMemoryDataset):
             f"size={stats['skip_size']}  "
             f"empty={stats['skip_empty']}"
         )
- 
+
         if not data_list:
             raise RuntimeError(
                 "No graphs loaded. Check:\n"
@@ -377,17 +454,17 @@ class JSLibsDataset(InMemoryDataset):
                 f"  4. Split mode detected as '{mode}' — "
                 "verify split.json schema matches"
             )
- 
+
         if self.pre_filter is not None:
             data_list = [d for d in data_list if self.pre_filter(d)]
         if self.pre_transform is not None:
             data_list = [self.pre_transform(d) for d in data_list]
- 
+
         torch.save(self.collate(data_list), self.processed_paths[0])
         torch.save(split_dict,              self.processed_paths[1])
- 
+
     # ------------------------------------------------------------------ #
- 
+
     def get_idx_split(self) -> Dict[str, List[int]]:
         """
         Returns {"train": [...], "val": [...], "test": [...]}.
@@ -403,15 +480,15 @@ class JSLibsDataset(InMemoryDataset):
         for k in ("train", "val", "test"):
             d.setdefault(k, [])
         return d
- 
+
     def __repr__(self) -> str:
         return f"JSLibsDataset(graphs={len(self)}, classes={self.num_classes})"
- 
- 
+
+
 # =============================================================================
 # Label map  (inference helper)
 # =============================================================================
- 
+
 def build_label_map(split_json: str) -> Dict[int, str]:
     """idx → lib@ver  (mirrors JSLibsDataset.process() ordering)."""
     with open(split_json) as f:
@@ -421,6 +498,7 @@ def build_label_map(split_json: str) -> Dict[int, str]:
 
 # =============================================================================
 # Test / debug
+# python graphgps/loader/dataset/jslibs.py
 # =============================================================================
 
 if __name__ == "__main__":
