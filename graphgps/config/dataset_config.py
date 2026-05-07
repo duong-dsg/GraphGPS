@@ -17,3 +17,22 @@ def dataset_cfg(cfg):
 
     # infer-link parameters (e.g., edge prediction task)
     cfg.dataset.infer_link_label = "None"
+
+    # ── JSLibs dataset ────────────────────────────────────────────────────────
+ 
+    # Path to the directory containing lib@ver/ graph subdirectories.
+    # Empty string → falls back to <dataset_dir>/raw/ (original behaviour).
+    cfg.dataset.data_dir = ""
+ 
+    # Path to split.json — used by the logger to show lib names instead of
+    # class indices in the per-class accuracy breakdown.
+    cfg.dataset.label_map_path = ""
+ 
+    # Vocabulary size for CPGNodeEncoder embedding mode.
+    # 0 → use hash/linear projection fallback.
+    # Set to the value printed by cpg_vocab.py after building the vocab.
+    cfg.dataset.node_encoder_vocab_size = 0
+ 
+    # Graph size filters applied during JSLibsDataset.process().
+    cfg.dataset.min_nodes = 5
+    cfg.dataset.max_nodes = 2000

@@ -6,7 +6,7 @@
 out_dir: results
 metric_best: accuracy-JS
 metric_agg: argmax
-name_tag: v2
+name_tag: v3
 
 wandb:
   use: False   # disable until pipeline is validated
@@ -29,6 +29,8 @@ dataset:
   edge_encoder_bn: False
   split_index: 0
   split_mode: standard
+  data_dir: /home/aiuser4/ado/bundled-js-scan/data/train/v2.2  # ← new
+
 
 # ----------------------------------------------------------------
 # Positional Encoding — LapPE

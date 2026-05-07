@@ -27,7 +27,7 @@ Vocab file format
 Build the vocab, then delete processed/ directory:
 (note the vocab size printed, e.g. "Vocabulary size: 312")
 
-python -m graphgps.loader.dataset.cpg_vocab --raw_dir datasets/JSLibs/raw
+python -m graphgps.loader.dataset.cpg_vocab --raw_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2
 rm -rf datasets/JSLibs/processed/
 """
 

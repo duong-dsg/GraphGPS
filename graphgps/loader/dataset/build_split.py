@@ -19,38 +19,56 @@ open
 
 Directory structure assumed
 ---------------------------
-raw/
-  axios@1.7.9/            ← lib key  (lib_name@lib_version)
-    rollup@4.46.2/        ← bundler@bundlerver
+<data_dir>/                   ← where lib@ver/ graph dirs live
+  axios@1.7.9/
+    rollup@4.46.2/
       graphs/
         a.xml
     webpack@5.95.0/
       graphs/
         e.xml
 
+<raw_dir>/                    ← where split.json is written
+  split.json                  ← OUTPUT
+
+data_dir defaults to raw_dir when not specified (original behaviour).
+
 Output
 ------
 raw/split.json
 
   closed mode:
-    { "axios@1.7.9": { "a.xml": "train", "b.xml": "val", ... }, ... }
+    {
+      "axios@1.7.9": {
+        "rollup@4.46.2/graphs/a.xml": "train",
+        "webpack@5.95.0/graphs/e.xml": "val",
+        ...
+      },
+      ...
+    }
 
   open mode:
     { "axios@1.7.9": "train", "lodash@4.17.21": "test", ... }
 
 Usage
 -----
-    # closed-set split (recommended first step)
-    python build_split.py --raw_dir datasets/JSLibs/raw --mode closed
+    # closed-set split, graphs in raw/ (original)
+    python graphgps/loader/dataset/build_split.py --raw_dir datasets/JSLibs/raw --mode closed
 
-    # open-set split
-    python build_split.py --raw_dir datasets/JSLibs/raw --mode open
+    # closed-set split, graphs in a custom path
+    python graphgps/loader/dataset/build_split.py \
+        --raw_dir  datasets/JSLibs/raw \
+        --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
+        --mode closed --seed 42
+
+    # open-set split from custom path
+    python graphgps/loader/dataset/build_split.py \
+        --raw_dir  datasets/JSLibs/raw \
+        --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
+        --mode open --seed 42
 
     # dry run — print summary, do not write
-    python build_split.py --raw_dir datasets/JSLibs/raw --mode closed --dry_run
-
-    # generate the split ONCE before any training
-    python graphgps/loader/dataset/build_split.py --raw_dir datasets/JSLibs/raw --mode closed --seed 42
+    python graphgps/loader/dataset/build_split.py --raw_dir datasets/JSLibs/raw --mode closed --dry_run
 """
 
 import argparse
@@ -67,17 +85,18 @@ from typing import Dict, List, Tuple
 # shared helpers
 # ---------------------------------------------------------------------------
 
-_BUNDLER_PREFIXES = ("rollup", "webpack", "vite", "parcel", "esbuild", "browserify")
+_BUNDLER_PREFIXES = ("rollup", "webpack", "vite", "parcel",
+                     "esbuild", "browserify")
 
 
-def _is_lib_dir(name: str, raw_dir: str) -> bool:
-    path = osp.join(raw_dir, name)
-    if not osp.isdir(path):
+def _is_lib_dir(name: str, parent: str) -> bool:
+    """True if name looks like a lib@ver directory (not a bundler or hidden dir)."""
+    if not osp.isdir(osp.join(parent, name)):
         return False
     low = name.lower()
     if any(low.startswith(p) for p in _BUNDLER_PREFIXES):
         return False
-    if name in ("node_modules", ".git", "__pycache__"):
+    if name in ("node_modules", ".git", "__pycache__", "raw", "processed"):
         return False
     return True
 
@@ -101,14 +120,14 @@ def _graph_files(graphs_dir: str) -> List[str]:
 
 def _all_graphs_for_lib(lib_dir: str) -> List[Tuple[str, str]]:
     """
-    Returns list of (bundler_ver, fname) for every graph file under lib_dir.
-    Skips non-directory entries (bundle.js, build.log, …).
+    Returns [(bundler_ver, fname), ...] for every graph under lib_dir.
+    Key format: bundler@ver/graphs/fname  — matches what process() expects.
     """
     result = []
     for bundler_ver in sorted(os.listdir(lib_dir)):
         bundler_dir = osp.join(lib_dir, bundler_ver)
         if not osp.isdir(bundler_dir):
-            continue
+            continue                          # skip bundle.js, build.log, etc.
         graphs_dir = osp.join(bundler_dir, "graphs")
         if not osp.isdir(graphs_dir):
             continue
@@ -126,7 +145,7 @@ def _count_graphs_for_lib(lib_dir: str) -> int:
 # ---------------------------------------------------------------------------
 
 def build_split_closed(
-    raw_dir: str,
+    data_dir: str,
     train_ratio: float = 0.70,
     val_ratio: float   = 0.15,
     seed: int          = 42,
@@ -143,45 +162,48 @@ def build_split_closed(
             "rollup@4.46.2/graphs/func_001.xml": "train",
             "rollup@4.46.2/graphs/func_002.xml": "val",
             "webpack@5.95.0/graphs/func_003.xml": "test",
-            ...
           },
-          ...
         }
 
-    Keys inside each lib dict are  "bundler@ver/graphs/fname"
-    so they are unambiguous across bundlers.
+    Keys inside each lib dict are "bundler@ver/graphs/fname" — these must
+    match exactly what jslibs.py builds when walking the same data_dir.
     """
     rng = random.Random(seed)
 
     lib_dirs = [
-        d for d in sorted(os.listdir(raw_dir))
-        if _is_lib_dir(d, raw_dir)
+        d for d in sorted(os.listdir(data_dir))
+        if _is_lib_dir(d, data_dir)
     ]
     if not lib_dirs:
-        raise RuntimeError(f"No lib directories found in {raw_dir}")
+        raise RuntimeError(
+            f"No lib directories found in data_dir: {data_dir}\n"
+            f"Expected subdirectories like  axios@1.7.9/  with bundler subdirs inside."
+        )
 
     split_map: Dict[str, Dict[str, str]] = {}
     totals = {"train": 0, "val": 0, "test": 0}
 
     for lib in lib_dirs:
-        lib_dir = osp.join(raw_dir, lib)
+        lib_dir = osp.join(data_dir, lib)
         graphs  = _all_graphs_for_lib(lib_dir)   # [(bundler_ver, fname), ...]
 
         if not graphs:
+            print(f"  [WARN] {lib}: no graph files found — skipped")
             continue
 
         rng.shuffle(graphs)
         n       = len(graphs)
         n_train = max(1, round(n * train_ratio))
         n_val   = max(1, round(n * val_ratio))
-        # ensure at least 1 in test too if enough graphs exist
+
+        # ensure at least 1 in each split when there are enough graphs
         if n >= 3:
             n_train = max(1, min(n_train, n - 2))
             n_val   = max(1, min(n_val,   n - n_train - 1))
 
         lib_map: Dict[str, str] = {}
         for i, (bundler_ver, fname) in enumerate(graphs):
-            key = f"{bundler_ver}/graphs/{fname}"
+            key = f"{bundler_ver}/graphs/{fname}"   # ← exact key process() looks up
             if i < n_train:
                 lib_map[key] = "train"
             elif i < n_train + n_val:
@@ -191,7 +213,6 @@ def build_split_closed(
 
         split_map[lib] = lib_map
 
-        # tally
         for sp in ("train", "val", "test"):
             totals[sp] += sum(1 for v in lib_map.values() if v == sp)
 
@@ -204,7 +225,7 @@ def build_split_closed(
 # ---------------------------------------------------------------------------
 
 def build_split_open(
-    raw_dir: str,
+    data_dir: str,
     train_ratio: float  = 0.70,
     val_ratio: float    = 0.15,
     seed: int           = 42,
@@ -220,11 +241,13 @@ def build_split_open(
     rng = random.Random(seed)
 
     lib_dirs = [
-        d for d in sorted(os.listdir(raw_dir))
-        if _is_lib_dir(d, raw_dir)
+        d for d in sorted(os.listdir(data_dir))
+        if _is_lib_dir(d, data_dir)
     ]
     if not lib_dirs:
-        raise RuntimeError(f"No lib directories found in {raw_dir}")
+        raise RuntimeError(
+            f"No lib directories found in data_dir: {data_dir}"
+        )
 
     # group by base name to avoid version leakage
     groups: Dict[str, List[str]] = defaultdict(list)
@@ -232,29 +255,31 @@ def build_split_open(
         key = _lib_base_name(lib) if group_by_base else lib
         groups[key].append(lib)
 
-    # sort groups by total graph count (descending) for stratification
+    # sort by total graph count (descending) for stratification
     group_sizes: List[Tuple[int, str]] = sorted(
         [
-            (sum(_count_graphs_for_lib(osp.join(raw_dir, m)) for m in members), base)
+            (
+                sum(_count_graphs_for_lib(osp.join(data_dir, m))
+                    for m in members),
+                base,
+            )
             for base, members in groups.items()
         ],
         reverse=True,
     )
 
     n = len(group_sizes)
-
-    # Guarantee at least 1 group in each split regardless of n or ratios.
-    # With only 3 groups: train=1, val=1, test=1.
-    # With only 2 groups: train=1, val=1, test=0  (warn user).
     if n < 3:
-        print(f"\n⚠️  WARNING: only {n} lib group(s) found — too few for a "
-              f"meaningful 3-way split.\n"
-              f"   Add more libs to raw/ before training.\n"
-              f"   Assigning: train={max(1,n-1)}  val={min(1,n-1)}  test={max(0,n-2)}")
+        print(
+            f"\n⚠️  WARNING: only {n} lib group(s) found — too few for a "
+            f"meaningful 3-way split.\n"
+            f"   Add more libs before training.\n"
+            f"   Assigning: train={max(1,n-1)}  val={min(1,n-1)}"
+            f"  test={max(0,n-2)}"
+        )
 
     n_train = max(1, round(n * train_ratio))
     n_val   = max(1, round(n * val_ratio))
-    # clamp so train + val never exceeds n, leaving at least 1 for test if possible
     if n_train + n_val >= n:
         n_train = max(1, n - 2)
         n_val   = max(1, n - n_train - 1) if n > 2 else min(1, n - n_train)
@@ -268,7 +293,9 @@ def build_split_open(
 
     split_map: Dict[str, str] = {}
     for i, (_, base) in enumerate(shuffled):
-        sp = "train" if i < thresholds[0] else ("val" if i < thresholds[1] else "test")
+        sp = ("train" if i < thresholds[0]
+              else "val" if i < thresholds[1]
+              else "test")
         for member in groups[base]:
             split_map[member] = sp
 
@@ -276,7 +303,7 @@ def build_split_open(
     graph_counts = {"train": 0, "val": 0, "test": 0}
     for lib, sp in split_map.items():
         lib_counts[sp]   += 1
-        graph_counts[sp] += _count_graphs_for_lib(osp.join(raw_dir, lib))
+        graph_counts[sp] += _count_graphs_for_lib(osp.join(data_dir, lib))
 
     _print_summary("open", split_map.keys(), graph_counts, lib_counts)
     return split_map
@@ -287,13 +314,14 @@ def build_split_open(
 # ---------------------------------------------------------------------------
 
 def _print_summary(mode, lib_names, graph_counts, lib_counts=None):
-    print(f"\nMode: {mode}")
+    print(f"\nMode  : {mode}")
+    print(f"Libs  : {len(list(lib_names))}")
     print(f"{'Split':<8}  {'Libs':>6}  {'Graphs':>8}")
-    print("-" * 30)
+    print("─" * 30)
     total_g = total_l = 0
     for sp in ("train", "val", "test"):
         lc = lib_counts[sp] if lib_counts else "—"
-        gc = graph_counts[sp]
+        gc = graph_counts.get(sp, 0)
         print(f"  {sp:<6}  {str(lc):>6}  {gc:>8}")
         total_g += gc
         if lib_counts:
@@ -310,35 +338,66 @@ def main():
         description="Build train/val/test split for JSLibs dataset",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--raw_dir", default="datasets/JSLibs/raw")
-    parser.add_argument("--mode",    default="closed", choices=["closed", "open"],
-                        help="closed = same libs in all splits (classifier); "
-                             "open   = test libs unseen in training (metric learning)")
+    parser.add_argument(
+        "--raw_dir", default="datasets/JSLibs/raw",
+        help="Directory where split.json will be written "
+             "(also used as data_dir when --data_dir is not set)",
+    )
+    parser.add_argument(
+        "--data_dir", default=None,
+        help="Directory containing lib@ver/ graph subdirectories. "
+             "Defaults to --raw_dir when not set.",
+    )
+    parser.add_argument(
+        "--mode", default="closed", choices=["closed", "open"],
+        help="closed = same libs in all splits (classifier); "
+             "open   = test libs unseen in training (metric learning)",
+    )
     parser.add_argument("--train",   type=float, default=0.70)
     parser.add_argument("--val",     type=float, default=0.15)
     parser.add_argument("--seed",    type=int,   default=42)
-    parser.add_argument("--no_group_versions", action="store_true",
-                        help="[open mode only] treat each lib@version independently")
-    parser.add_argument("--out",     default=None,
-                        help="Output path (default: <raw_dir>/split.json)")
-    parser.add_argument("--dry_run", action="store_true",
-                        help="Print summary without writing file")
+    parser.add_argument(
+        "--no_group_versions", action="store_true",
+        help="[open mode only] treat each lib@version independently "
+             "(may allow version leakage — not recommended)",
+    )
+    parser.add_argument(
+        "--out", default=None,
+        help="Output path for split.json (default: <raw_dir>/split.json)",
+    )
+    parser.add_argument(
+        "--dry_run", action="store_true",
+        help="Print summary without writing file",
+    )
     args = parser.parse_args()
+
+    # resolve data_dir — default to raw_dir (original behaviour)
+    data_dir = args.data_dir or args.raw_dir
+    if not osp.isdir(data_dir):
+        raise SystemExit(f"[ERROR] data_dir not found: {data_dir}")
+    if not osp.isdir(args.raw_dir):
+        os.makedirs(args.raw_dir, exist_ok=True)
+        print(f"Created raw_dir: {args.raw_dir}")
+
+    print(f"raw_dir  : {osp.abspath(args.raw_dir)}")
+    print(f"data_dir : {osp.abspath(data_dir)}")
+    print(f"mode     : {args.mode}  |  seed={args.seed}  "
+          f"|  train={args.train}  val={args.val}")
 
     if args.mode == "closed":
         result = build_split_closed(
-            raw_dir=args.raw_dir,
-            train_ratio=args.train,
-            val_ratio=args.val,
-            seed=args.seed,
+            data_dir    = data_dir,
+            train_ratio = args.train,
+            val_ratio   = args.val,
+            seed        = args.seed,
         )
     else:
         result = build_split_open(
-            raw_dir=args.raw_dir,
-            train_ratio=args.train,
-            val_ratio=args.val,
-            seed=args.seed,
-            group_by_base=not args.no_group_versions,
+            data_dir      = data_dir,
+            train_ratio   = args.train,
+            val_ratio     = args.val,
+            seed          = args.seed,
+            group_by_base = not args.no_group_versions,
         )
 
     if args.dry_run:
@@ -348,7 +407,7 @@ def main():
     out_path = args.out or osp.join(args.raw_dir, "split.json")
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2, sort_keys=True)
-    print(f"\nWrote → {out_path}")
+    print(f"\nWrote → {out_path}  ({len(result)} libs)")
 
 
 if __name__ == "__main__":

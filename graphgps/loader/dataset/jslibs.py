@@ -240,6 +240,7 @@ class JSLibsDataset(InMemoryDataset):
     def __init__(
         self,
         root: str,
+        data_dir: Optional[str]            = None,
         split_path: Optional[str]          = None,
         min_nodes: int                     = 5,
         max_nodes: int                     = 2000,
@@ -248,6 +249,11 @@ class JSLibsDataset(InMemoryDataset):
         pre_transform: Optional[Callable]  = None,
         pre_filter: Optional[Callable]     = None,
     ):
+        # data_dir: where lib@ver/ graph directories live.
+        # Defaults to raw/ so existing behaviour is unchanged.
+        # When set to a custom path, raw/ still holds split.json
+        # and cpg_vocab.json; processed/ is under root as usual.
+        self._data_dir              = data_dir   # None = use self.raw_dir
         self.split_path             = split_path or osp.join(root, "raw", "split.json")
         self.min_nodes              = min_nodes
         self.max_nodes              = max_nodes
@@ -262,6 +268,11 @@ class JSLibsDataset(InMemoryDataset):
     def raw_dir(self):       return osp.join(self.root, "raw")
     @property
     def processed_dir(self): return osp.join(self.root, "processed")
+    @property
+    def graph_dir(self) -> str:
+        """Root directory containing lib@ver/ graph subdirectories.
+        Falls back to raw_dir when data_dir is not set."""
+        return self._data_dir if self._data_dir else self.raw_dir
     @property
     def raw_file_names(self): return ["split.json"]
     @property
@@ -322,8 +333,12 @@ class JSLibsDataset(InMemoryDataset):
         stats = {"loaded": 0, "skip_parse": 0, "skip_size": 0,
                  "skip_empty": 0, "skip_not_in_split": 0}
 
-        for lib_ver in sorted(os.listdir(self.raw_dir)):
-            lib_dir = osp.join(self.raw_dir, lib_ver)
+        graph_root = self.graph_dir
+        log.info("Graph source directory: %s", graph_root)
+        print(f"Graph source: {graph_root}")
+
+        for lib_ver in sorted(os.listdir(graph_root)):
+            lib_dir = osp.join(graph_root, lib_ver)
             if not osp.isdir(lib_dir):
                 continue
             if lib_ver not in lib_split:
@@ -477,6 +492,7 @@ if __name__ == "__main__":
 
     dataset = JSLibsDataset(
         root=ROOT,
+        data_dir="/home/aiuser4/ado/bundled-js-scan/data/train/v2.2",  # ← override raw_dir for graphs
         split_path=osp.join(ROOT, "raw", "split.json"),
         max_graphs_per_bundler=10  # keep small for debugging
     )

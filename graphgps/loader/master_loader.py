@@ -657,7 +657,27 @@ def preformat_JSLibs(dataset_dir, name):
         PyG dataset object (InMemoryDataset)
     """
     # ---- Load dataset ----
-    dataset = JSLibsDataset(root=dataset_dir)
+    # dataset = JSLibsDataset(root=dataset_dir)
+    # dataset.name = "JSLibs"
+    # ── resolve custom graph data directory ───────────────────────────────────
+    data_dir = getattr(cfg.dataset, "data_dir", None)
+    if data_dir and not osp.isdir(data_dir):
+        raise FileNotFoundError(
+            f"cfg.dataset.data_dir does not exist: {data_dir}\n"
+            f"Set it to the directory containing your lib@ver/ graph folders."
+        )
+    if data_dir:
+        logging.info(f"JSLibs: loading graphs from custom data_dir: {data_dir}")
+    else:
+        logging.info("JSLibs: data_dir not set — using raw/ for graphs")
+ 
+    # ── instantiate dataset ───────────────────────────────────────────────────
+    dataset = JSLibsDataset(
+        root      = dataset_dir,    # raw/ and processed/ always here
+        data_dir  = data_dir,       # lib@ver/ graph dirs (None = use raw/)
+        min_nodes = getattr(cfg.dataset, "min_nodes", 5),
+        max_nodes = getattr(cfg.dataset, "max_nodes", 2000),
+    )
     dataset.name = "JSLibs"
     # =========================
     # 1. Split handling (CRITICAL)
