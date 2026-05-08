@@ -1,3 +1,9 @@
+# CUSTOM: JSLibs dataset 
+# /scripts/jslibs/eda_output/
+scripts/explore/eda_output/
+scripts/plots/
+AGENTS.md
+
 # CUSTOM
 .vscode/
 scripts/pcqm4m/**/*.zip
@@ -54,9 +60,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-# /scripts/jslibs/eda_output/
-scripts/explore/eda_output/
-scripts/plots/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
