@@ -352,7 +352,7 @@ def plot_curves(run: Dict, run_name: str, save_dir: str):
     if not avail:
         print("  [WARN] No metrics found — skipping curves plot.")
         return
-
+ 
     # Build panels: only groups with at least one available metric
     panels = [
         (title, [m for m in mkeys if m in avail])
@@ -363,25 +363,25 @@ def plot_curves(run: Dict, run_name: str, save_dir: str):
     extra   = [m for m in avail if m not in covered]
     if extra:
         panels.append(("Other", extra))
-
+ 
     n = len(panels)
     if n == 0:
         return
-
+ 
     fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 4.2),
                               facecolor=THEME["bg"])
-
+ 
     if n == 1:
         axes = [axes]
-
+ 
     # Best epoch marker from val best.json
     best_ep = (run.get("val", {}).get("best") or {}).get("epoch")
-
+ 
     line_dash = ["-", "--", "-.", (0, (3,1,1,1))]
-
+ 
     for ax, (panel_title, mkeys) in zip(axes, panels):
         ax.set_facecolor(THEME["panel"])
-
+ 
         plotted = False
         for split in ("train", "val", "test"):
             if split not in run:
@@ -391,11 +391,11 @@ def plot_curves(run: Dict, run_name: str, save_dir: str):
                 ep, vals = metric_series(stats, metric)
                 if not vals:
                     continue
-
+ 
                 ls = SPLIT_LS[split]
                 if len(mkeys) > 1:
                     ls = line_dash[mi % len(line_dash)]
-
+ 
                 label = f"{split}  {METRIC_LABEL.get(metric, metric)}"
                 # smoothed background line for readability
                 if len(vals) > 10:
@@ -412,30 +412,30 @@ def plot_curves(run: Dict, run_name: str, save_dir: str):
                         markevery=max(1, len(ep) // 20),
                         label=label, alpha=0.92, zorder=3)
                 plotted = True
-
+ 
         if not plotted:
             ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
                     ha="center", va="center", color=THEME["muted"])
-
+ 
         # Best epoch vertical line
         if best_ep is not None:
             ax.axvline(best_ep, color="#f78166", linestyle="--",
                        linewidth=1.1, alpha=0.7, zorder=1,
                        label=f"best ep={best_ep}")
-
+ 
         ylabel = (METRIC_LABEL.get(mkeys[0], mkeys[0])
                   if len(mkeys) == 1 else "Score")
         _style_ax(ax, panel_title, ylabel)
         # ncol: 3 for single-metric panels (train/val/test), more for multi
         _place_legend_below(ax, ncol=3 if len(mkeys) == 1 else 4)
-
+ 
     # Reserve space at the bottom for the below-axes legends
     fig.subplots_adjust(bottom=0.28, top=0.92, wspace=0.32)
-
+ 
     fig.suptitle(f"Training Curves  ·  {run_name}",
                  fontsize=11, fontweight="bold",
                  color=THEME["text"], x=0.01, ha="left", y=0.99)
-
+ 
     # Use savefig directly — tight_layout would fight subplots_adjust
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -461,34 +461,35 @@ def plot_best_bar(run: Dict, run_name: str, save_dir: str):
         row = {m: float(best[m]) for m in KEY_METRICS if m in best}
         if row:
             data[split] = row
-
+ 
     if not data:
         print("  [WARN] No best-epoch data — skipping bar chart.")
         return
-
+ 
     present = [m for m in KEY_METRICS if any(m in v for v in data.values())]
     if not present:
         return
-
+ 
     splits  = [s for s in ("train", "val", "test") if s in data]
     x       = np.arange(len(present))
     n_sp    = len(splits)
     w       = 0.22
     offsets = np.linspace(-(n_sp - 1) * w / 2, (n_sp - 1) * w / 2, n_sp)
-
+ 
     fig, ax = plt.subplots(figsize=(max(8, len(present) * 2.2), 5),
                             facecolor=THEME["bg"])
     ax.set_facecolor(THEME["panel"])
-
+ 
     for sp, off in zip(splits, offsets):
         vals = [data[sp].get(m, 0.0) for m in present]
         bars = ax.bar(
             x + off, vals, w,
             label=sp,
             color=SPLIT_COLOR[sp],
-            alpha=0.85,
-            edgecolor=THEME["bg"],
-            linewidth=0.8,
+            alpha=0.90,
+            edgecolor="none",
+            linewidth=0,
+            zorder=3,
         )
         for bar, val in zip(bars, vals):
             if val > 0.005:
@@ -500,7 +501,7 @@ def plot_best_bar(run: Dict, run_name: str, save_dir: str):
                     fontsize=6.8, color=THEME["text"],
                     rotation=90,
                 )
-
+ 
     ax.set_xticks(x)
     ax.set_xticklabels(
         [METRIC_LABEL.get(m, m) for m in present],
@@ -514,22 +515,24 @@ def plot_best_bar(run: Dict, run_name: str, save_dir: str):
     ax.set_ylim(0, top)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
     ax.tick_params(axis="y", labelsize=7.5, colors=THEME["muted"])
-    ax.grid(axis="y", color=THEME["grid"], linewidth=0.6)
+    ax.tick_params(axis="x", length=0)
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color=THEME["grid"], linewidth=0.6, zorder=0)
     for spine in ax.spines.values():
-        spine.set_edgecolor(THEME["border"])
-
+        spine.set_visible(False)
+ 
     # Reference lines at 0.5 and 0.75
     for ref in (0.5, 0.75):
         if ref < top:
             ax.axhline(ref, color=THEME["muted"], linewidth=0.5,
                        linestyle=":", alpha=0.6)
-
+ 
     # Legend for bar chart: place top-right corner inside (bars don't reach there)
     leg = ax.legend(fontsize=8.5, fancybox=False,
                     edgecolor=THEME["border"], framealpha=0.85,
                     loc="upper right")
     leg.get_frame().set_linewidth(0.5)
-
+ 
     fig.suptitle(f"Best-Epoch Metrics  ·  {run_name}",
                  fontsize=11, fontweight="bold",
                  color=THEME["text"], x=0.01, ha="left", y=1.0)
@@ -558,7 +561,8 @@ def plot_timing(run: Dict, run_name: str, save_dir: str):
     ax = axes[0]
     ax.set_facecolor(THEME["panel"])
     ax.plot(ep, times, color=col, linewidth=1.2,
-            marker="o", markersize=2.2, alpha=0.9, label="time/epoch")
+            marker="o", markersize=2.2, alpha=0.9)
+    # highlight outliers (> mean + 2σ)
     arr = np.array(times)
     thresh = arr.mean() + 2 * arr.std()
     out_x = [e for e, t in zip(ep, times) if t > thresh]
@@ -566,15 +570,16 @@ def plot_timing(run: Dict, run_name: str, save_dir: str):
     if out_x:
         ax.scatter(out_x, out_y, color="#f78166", zorder=5,
                    s=28, label=f"spike (>{thresh:.0f}s)")
+        ax.legend(fontsize=7)
     _style_ax(ax, "Train time / epoch  (s)", "seconds")
-    _place_legend_below(ax, ncol=2)
 
     # — cumulative time —
     ax = axes[1]
     ax.set_facecolor(THEME["panel"])
     cum = np.cumsum(times) / 60
     ax.fill_between(ep, cum, alpha=0.18, color=col)
-    ax.plot(ep, cum, color=col, linewidth=1.4, label="cumulative")
+    ax.plot(ep, cum, color=col, linewidth=1.4)
+    # annotate final value
     ax.annotate(
         f"total: {cum[-1]:.1f} min",
         xy=(ep[-1], cum[-1]),
@@ -583,7 +588,6 @@ def plot_timing(run: Dict, run_name: str, save_dir: str):
         arrowprops=dict(arrowstyle="->", color=col, lw=0.8),
     )
     _style_ax(ax, "Cumulative time  (min)", "minutes")
-    _place_legend_below(ax, ncol=1)
 
     # — ETA curve —
     ax = axes[2]
@@ -591,27 +595,18 @@ def plot_timing(run: Dict, run_name: str, save_dir: str):
     if etas:
         ep2, etas2 = metric_series(stats, "eta_hours")
         ax.fill_between(ep2, etas2, alpha=0.18, color=SPLIT_COLOR["val"])
-        ax.plot(ep2, etas2, color=SPLIT_COLOR["val"], linewidth=1.4, label="ETA")
+        ax.plot(ep2, etas2, color=SPLIT_COLOR["val"], linewidth=1.4)
         _style_ax(ax, "Remaining time  (ETA, hrs)", "hours")
-        _place_legend_below(ax, ncol=1)
     else:
         ax.text(0.5, 0.5, "no eta data",
                 transform=ax.transAxes, ha="center",
                 va="center", color=THEME["muted"])
         _style_ax(ax, "ETA", "hours")
 
-    fig.subplots_adjust(bottom=0.26, top=0.90, wspace=0.35)
     fig.suptitle(f"Training Time  ·  {run_name}",
                  fontsize=11, fontweight="bold",
-                 color=THEME["text"], x=0.01, ha="left", y=0.99)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        out = osp.join(save_dir, "03_timing.png")
-        fig.savefig(out, dpi=150, bbox_inches="tight")
-        print(f"  saved  →  {out}")
-    else:
-        plt.show()
-    plt.close(fig)
+                 color=THEME["text"], x=0.01, ha="left", y=1.01)
+    _save_or_show(fig, save_dir, "03_timing.png")
 
 
 # =============================================================================
@@ -661,20 +656,11 @@ def plot_repeat_variance(run_dir: str, metric: str, split: str,
     _style_ax(ax,
               f"Repeat Variance  ·  {METRIC_LABEL.get(metric, metric)}  [{split}]",
               METRIC_LABEL.get(metric, metric))
-    fig.subplots_adjust(bottom=0.28, top=0.90)
-    _place_legend_below(ax, ncol=4)
     fig.suptitle(f"Seed Variance  ·  {run_name}",
                  fontsize=11, fontweight="bold",
-                 color=THEME["text"], x=0.01, ha="left", y=0.99)
+                 color=THEME["text"], x=0.01, ha="left", y=1.01)
     fname = f"04_variance_{split}_{metric.replace('-','_')}.png"
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        out = osp.join(save_dir, fname)
-        fig.savefig(out, dpi=150, bbox_inches="tight")
-        print(f"  saved  →  {out}")
-    else:
-        plt.show()
-    plt.close(fig)
+    _save_or_show(fig, save_dir, fname)
 
 
 # =============================================================================
@@ -718,20 +704,11 @@ def plot_comparison(runs: Dict[str, Dict], metrics: List[str],
         _style_ax(ax,
                   f"{METRIC_LABEL.get(metric, metric)}  [{split}]",
                   METRIC_LABEL.get(metric, metric))
-        _place_legend_below(ax, ncol=min(3, len(runs)))
 
-    fig.subplots_adjust(bottom=0.30, top=0.90, wspace=0.35)
     fig.suptitle(f"Run Comparison  ·  {split} split",
                  fontsize=11, fontweight="bold",
-                 color=THEME["text"], x=0.01, ha="left", y=0.99)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        out = osp.join(save_dir, f"05_compare_{split}.png")
-        fig.savefig(out, dpi=150, bbox_inches="tight")
-        print(f"  saved  →  {out}")
-    else:
-        plt.show()
-    plt.close(fig)
+                 color=THEME["text"], x=0.01, ha="left", y=1.01)
+    _save_or_show(fig, save_dir, f"05_compare_{split}.png")
 
 
 # =============================================================================

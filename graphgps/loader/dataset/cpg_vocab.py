@@ -25,10 +25,14 @@ python -m graphgps.loader.dataset.cpg_vocab \
     --verbose
 
 # Inspect file structure to find the right --label_key
+# --max_bundles bundles is more than enough to saturate CPG vocab
 python -m graphgps.loader.dataset.cpg_vocab \
     --raw_dir  datasets/JSLibs/raw \
     --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
-    --inspect
+    --lib   async axios lodash express chalk commander react request rxjs uuid  \
+    --bundler rollup@4.46.2 webpack@5.95.0 \
+    --inspect \
+    --max_bundles 50
 
 # Then remove processed vocab before run training:
 rm -rf datasets/JSLibs/processed/
@@ -39,13 +43,14 @@ import json
 import os
 import os.path as osp
 from collections import Counter
+import re
 
 
 # ── filter helpers (mirrors build_split.py / eda.py) ─────────────────────────
 
 _BUNDLER_PREFIXES = ("rollup", "webpack", "vite",
                      "parcel", "esbuild", "browserify")
-
+_DOT_LABEL_RE = re.compile(r'label\s*=\s*"([^"]*)"')
 
 def _is_lib_dir(name: str, parent: str) -> bool:
     if not osp.isdir(osp.join(parent, name)):
@@ -149,6 +154,47 @@ def _labels_from_xml(path: str, label_key: str = "label") -> List[str]:
     return labels
 
 
+# iterparse instead of ET.parse — streaming, ~10× faster for large files
+def _labels_from_xml_fast(path: str, label_key: str = "label") -> List[str]:
+    """
+    Stream-parse XML with iterparse — never loads the full DOM.
+    Resolves GraphML key aliases on first pass, then streams nodes.
+    """
+    labels = []
+    # First pass: collect key map (only <key> elements, very fast)
+    key_map = {}
+    try:
+        for event, elem in ET.iterparse(path, events=("start",)):
+            tag = elem.tag.split("}")[-1]  # strip namespace
+            if tag == "key":
+                kid  = elem.get("id", "")
+                name = elem.get("attr.name", "")
+                if kid and name:
+                    key_map[name] = kid
+                    key_map[kid]  = name
+            elif tag == "graph":
+                break   # key declarations always come before graph body
+            elem.clear()
+
+        data_key = key_map.get(label_key, label_key)
+
+        # Second pass: stream node elements only
+        for event, elem in ET.iterparse(path, events=("end",)):
+            tag = elem.tag.split("}")[-1]
+            if tag == "node":
+                for child in elem:
+                    ctag = child.tag.split("}")[-1]
+                    if ctag == "data":
+                        k = child.get("key", "")
+                        if k in (data_key, label_key) and child.text:
+                            labels.append(child.text.strip())
+                            break
+                elem.clear()   # ← free memory immediately
+    except Exception:
+        pass
+    return labels
+
+
 def _labels_from_dot(path: str) -> List[str]:
     """Extract node label strings from a DOT file."""
     labels = []
@@ -164,6 +210,23 @@ def _labels_from_dot(path: str) -> List[str]:
             label = attrs.get("label", "").strip('"').strip()
             if label:
                 labels.append(label)
+    except Exception:
+        pass
+    return labels
+
+
+def _labels_from_dot_fast(path: str) -> List[str]:
+    """
+    Read DOT file as plain text and regex-extract label values.
+    ~100× faster than pydot for large files.
+    """
+    labels = []
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                m = _DOT_LABEL_RE.search(line)
+                if m:
+                    labels.append(m.group(1))
     except Exception:
         pass
     return labels
@@ -227,6 +290,7 @@ def build_vocab(
     verbose: bool = False,
     lib_filter: list = None,
     bundler_filter: list = None,
+    max_bundles: Optional[int] = None,
 ) -> Dict[str, int]:
     """
     Walk every graph file under data_dir and collect node label frequencies.
@@ -255,20 +319,46 @@ def build_vocab(
             graphs_dir = osp.join(lib_dir, bundler_ver, "graphs")
             if not osp.isdir(graphs_dir):
                 continue
-            for fname in os.listdir(graphs_dir):
-                fpath = osp.join(graphs_dir, fname)
-                if fname.endswith(".dot"):
-                    labels = _labels_from_dot(fpath)
-                elif fname.endswith(".xml"):
-                    labels = _labels_from_xml(fpath, label_key=label_key)
-                else:
-                    continue
-                n_files += 1
-                if not labels:
-                    n_empty += 1
-                    if verbose:
-                        print(f"  [EMPTY] {lib_ver}/{bundler_ver}/{fname}")
-                counter.update(labels)
+            # ── KEY CHANGE 1: only read _program file ──────────────────
+            prog_file = None
+            for ext in (".xml", ".dot"):
+                candidate = osp.join(graphs_dir, f"_program{ext}")
+                if osp.isfile(candidate):
+                    prog_file = candidate
+                    break
+
+            if prog_file is None:
+                continue   # no whole-program CPG, skip
+            #
+            # ── KEY CHANGE 2: streaming XML parse (iterparse) ──────────
+            if prog_file.endswith(".xml"):
+                labels = _labels_from_xml_fast(prog_file, label_key)
+            else:
+                labels = _labels_from_dot_fast(prog_file)
+
+            counter.update(labels)
+            n_bundles += 1
+            #
+            # ── KEY CHANGE 3: early exit once vocab saturates ──────────
+            if max_bundles and n_bundles >= max_bundles:
+                print(f"[early stop] reached {max_bundles} bundles, "
+                      f"{len(counter)} unique labels so far")
+                break
+            #
+            # for fname in os.listdir(graphs_dir):
+            #     fpath = osp.join(graphs_dir, fname)
+            #     if fname.endswith(".dot"):
+            #         labels = _labels_from_dot(fpath)
+            #     elif fname.endswith(".xml"):
+            #         labels = _labels_from_xml(fpath, label_key=label_key)
+            #     else:
+            #         continue
+            #     n_files += 1
+            #     if not labels:
+            #         n_empty += 1
+            #         if verbose:
+            #             print(f"  [EMPTY] {lib_ver}/{bundler_ver}/{fname}")
+            #     counter.update(labels)
 
     print(f"\nScanned {n_files} files  |  {n_empty} returned no labels")
     print(f"Unique labels found: {len(counter)}")
@@ -328,6 +418,9 @@ def main():
     parser.add_argument("--inspect",   action="store_true",
                         help="Print raw structure of first few graph files and exit. "
                              "Use this to find the correct --label_key.")
+    parser.add_argument("--max_bundles", type=int, default=None,
+                        help="For quick iteration: max number of bundles to scan "
+                             "before early exit (default: scan all).")
     parser.add_argument("--verbose",   action="store_true",
                         help="Print files that returned no labels + top-20 label list")
     args = parser.parse_args()
@@ -380,6 +473,7 @@ def main():
         verbose        = args.verbose,
         lib_filter     = lib_filter,
         bundler_filter = bundler_filter,
+        max_bundles    = args.max_bundles,
     )
     # vocab is always written to raw_dir so jslibs.py can find it
     out_path = args.out or osp.join(args.raw_dir, "cpg_vocab.json")
