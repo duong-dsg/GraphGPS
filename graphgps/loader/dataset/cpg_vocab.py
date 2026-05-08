@@ -31,7 +31,6 @@ python -m graphgps.loader.dataset.cpg_vocab \
     --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
     --lib   async axios lodash express chalk commander react request rxjs uuid  \
     --bundler rollup@4.46.2 webpack@5.95.0 \
-    --inspect \
     --max_bundles 50
 
 # Then remove processed vocab before run training:
@@ -302,6 +301,7 @@ def build_vocab(
     lib_filter     = lib_filter or []
     bundler_filter = bundler_filter or []
     counter: Counter = Counter()
+    n_bundles = 0
     n_files = 0
     n_empty = 0
 
