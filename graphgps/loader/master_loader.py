@@ -649,88 +649,118 @@ def join_dataset_splits(datasets):
 # =========================
 def preformat_JSLibs(dataset_dir, name):
     """
-    Load JS Libraries dataset (Joern → PyG → GraphGPS-ready)
-    Args:
-        dataset_dir: root dir (vd: datasets/JSLibs)
-        name: unused (giữ để compatible GraphGym)
-    Returns:
-        PyG dataset object (InMemoryDataset)
+    Load JS Libraries dataset (Joern CPG graphs → PyG → GraphGPS-ready).
+ 
+    Paths
+    -----
+    dataset_dir          : root directory (e.g. datasets/JSLibs)
+                           └── raw/
+                               ├── split.json       ← always here
+                               └── cpg_vocab.json   ← always here (optional)
+                           └── processed/
+                               ├── data.pt
+                               └── split_dict.pt
+ 
+    cfg.dataset.data_dir : (optional) path to directory containing
+                           lib@ver/ graph subdirectories.
+                           e.g. /home/aiuser4/ado/bundled-js-scan/data/train/v2.2
+                           If not set, falls back to raw/ (original behaviour).
+ 
+    Args
+    ----
+    dataset_dir : root dir passed by GraphGym (e.g. datasets/JSLibs)
+    name        : dataset name string (kept for GraphGym compatibility)
+ 
+    Returns
+    -------
+    PyG InMemoryDataset ready for GraphGPS
     """
-    # ---- Load dataset ----
-    # dataset = JSLibsDataset(root=dataset_dir)
-    # dataset.name = "JSLibs"
+ 
     # ── resolve custom graph data directory ───────────────────────────────────
-    data_dir = getattr(cfg.dataset, "data_dir", None)
+    # cfg.dataset.data_dir is registered in graphgps/config/jslibs_config.py.
+    # Empty string means "use raw/" (default).
+    data_dir = getattr(cfg.dataset, "data_dir", "").strip() or None
     if data_dir and not osp.isdir(data_dir):
         raise FileNotFoundError(
             f"cfg.dataset.data_dir does not exist: {data_dir}\n"
             f"Set it to the directory containing your lib@ver/ graph folders."
         )
-    if data_dir:
-        logging.info(f"JSLibs: loading graphs from custom data_dir: {data_dir}")
-    else:
-        logging.info("JSLibs: data_dir not set — using raw/ for graphs")
+    logging.info("JSLibs: graph source = %s",
+                 data_dir or f"{dataset_dir}/raw/ (default)")
  
     # ── instantiate dataset ───────────────────────────────────────────────────
+    bundler_filter = list(getattr(cfg.dataset, "bundler_filter", []) or [])
+    lib_filter     = list(getattr(cfg.dataset, "lib_filter",     []) or [])
+ 
+    logging.info("JSLibs: bundler_filter = %s",
+                 bundler_filter if bundler_filter else "ALL")
+    logging.info("JSLibs: lib_filter     = %s",
+                 lib_filter if lib_filter else "ALL")
+ 
     dataset = JSLibsDataset(
-        root      = dataset_dir,    # raw/ and processed/ always here
-        data_dir  = data_dir,       # lib@ver/ graph dirs (None = use raw/)
-        min_nodes = getattr(cfg.dataset, "min_nodes", 5),
-        max_nodes = getattr(cfg.dataset, "max_nodes", 2000),
+        root           = dataset_dir,    # raw/ and processed/ always here
+        data_dir       = data_dir,       # lib@ver/ graph dirs (None = use raw/)
+        bundler_filter = bundler_filter or None,
+        lib_filter     = lib_filter     or None,
+        min_nodes      = getattr(cfg.dataset, "min_nodes", 5),
+        max_nodes      = getattr(cfg.dataset, "max_nodes", 2000),
     )
     dataset.name = "JSLibs"
-    # =========================
-    # 1. Split handling (CRITICAL)
-    # =========================
+ 
+    # ==========================================================================
+    # 1. Split handling
+    # ==========================================================================
     split_dict = dataset.get_idx_split()
     dataset.split_idxs = [
-        split_dict['train'],
-        split_dict['val'],
-        split_dict['test']
+        split_dict["train"],
+        split_dict["val"],
+        split_dict["test"],
     ]
     logging.info(
         f"Splits: train={len(split_dict['train'])}, "
         f"val={len(split_dict['val'])}, "
         f"test={len(split_dict['test'])}"
     )
-    # =========================
-    # 2. Fix node features
-    # =========================
-    if not hasattr(dataset.data, 'x') or dataset.data.x is None:
+ 
+    # ==========================================================================
+    # 2. Node features
+    # ==========================================================================
+    if not hasattr(dataset.data, "x") or dataset.data.x is None:
         logging.warning("No node features found → using dummy features")
         dataset.data.x = torch.ones((dataset.data.num_nodes, 1))
-    # đảm bảo float (GraphGPS yêu cầu)
     if dataset.data.x.dtype != torch.float:
         dataset.data.x = dataset.data.x.float()
-    # =========================
-    # 3. Fix edge features
-    # =========================
-    if hasattr(dataset.data, 'edge_attr') and dataset.data.edge_attr is not None:
+ 
+    # ==========================================================================
+    # 3. Edge features
+    # ==========================================================================
+    if hasattr(dataset.data, "edge_attr") and dataset.data.edge_attr is not None:
         if dataset.data.edge_attr.dim() == 1:
             dataset.data.edge_attr = dataset.data.edge_attr.view(-1, 1)
         dataset.data.edge_attr = dataset.data.edge_attr.long()
     else:
-        # fallback nếu không có edge_attr
         num_edges = dataset.data.edge_index.shape[1]
         dataset.data.edge_attr = torch.zeros((num_edges, 1), dtype=torch.long)
-    # =========================
-    # 4. Task definition
-    # =========================
-    if hasattr(dataset.data, 'y') and dataset.data.y is not None:
-        dataset.data.y = dataset.data.y.view(-1)
-        # dataset.num_classes = int(dataset.data.y.max().item() + 1)
-    else:
-        raise ValueError("Dataset must have 'y' for classification task")
-    logging.info(f"Num classes: {dataset.num_classes}")
-    # =========================
-    # 5. Graph-level task flag (important)
-    # =========================
-    dataset.task_type = 'classification'
-    dataset.eval_metric = 'accuracy'
-    # =========================
-    # 6. Sanity check
-    # =========================
-    assert len(dataset) > 0, "Dataset is empty"
-    assert dataset.data.edge_index is not None
-    return dataset
  
+    # ==========================================================================
+    # 4. Labels
+    # ==========================================================================
+    if hasattr(dataset.data, "y") and dataset.data.y is not None:
+        dataset.data.y = dataset.data.y.view(-1)
+    else:
+        raise ValueError("Dataset must have 'y' labels for classification")
+    logging.info(f"Num classes: {dataset.num_classes}")
+ 
+    # ==========================================================================
+    # 5. Task flags
+    # ==========================================================================
+    dataset.task_type    = "classification"
+    dataset.eval_metric  = "accuracy"
+ 
+    # ==========================================================================
+    # 6. Sanity checks
+    # ==========================================================================
+    assert len(dataset) > 0, "Dataset is empty after processing"
+    assert dataset.data.edge_index is not None, "edge_index is None"
+ 
+    return dataset

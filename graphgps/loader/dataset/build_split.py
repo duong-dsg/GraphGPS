@@ -69,6 +69,13 @@ Usage
 
     # dry run — print summary, do not write
     python graphgps/loader/dataset/build_split.py --raw_dir datasets/JSLibs/raw --mode closed --dry_run
+
+    python graphgps/loader/dataset/build_split.py \
+    --raw_dir  datasets/JSLibs/raw \
+    --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
+    --mode closed --seed 42 \
+    --lib   async axios lodash express chalk commander react request rxjs uuid \
+    --bundler rollup@4.46.2 webpack@5.95.0
 """
 
 import argparse
@@ -101,6 +108,16 @@ def _is_lib_dir(name: str, parent: str) -> bool:
     return True
 
 
+def _lib_matches(lib_ver: str, lib_filter: list) -> bool:
+    """True when lib_filter is empty or lib_ver matches an entry.
+    Supports exact ('axios@1.7.9') and base-name ('axios') matching."""
+    if not lib_filter:
+        return True
+    base = lib_ver.split("@")[0] if not lib_ver.startswith("@") \
+           else "@" + lib_ver.split("@")[1]
+    return lib_ver in lib_filter or base in lib_filter
+
+
 def _lib_base_name(lib_dir_name: str) -> str:
     """axios@1.7.9 → axios  |  @scope/pkg@1.0 → @scope/pkg"""
     if lib_dir_name.startswith("@"):
@@ -118,16 +135,33 @@ def _graph_files(graphs_dir: str) -> List[str]:
     )
 
 
-def _all_graphs_for_lib(lib_dir: str) -> List[Tuple[str, str]]:
+def _bundler_matches(bundler_ver: str,
+                     bundler_filter: List[str]) -> bool:
+    """True if bundler_ver matches any entry in bundler_filter.
+    Supports exact match ('rollup@4.46.2') and base-name match ('rollup')."""
+    if not bundler_filter:
+        return True
+    bname = bundler_ver.split("@")[0]
+    return bundler_ver in bundler_filter or bname in bundler_filter
+
+
+def _all_graphs_for_lib(
+    lib_dir: str,
+    bundler_filter: List[str] = None,
+) -> List[Tuple[str, str]]:
     """
     Returns [(bundler_ver, fname), ...] for every graph under lib_dir.
     Key format: bundler@ver/graphs/fname  — matches what process() expects.
+    If bundler_filter is set, only matching bundler dirs are included.
     """
+    bundler_filter = bundler_filter or []
     result = []
     for bundler_ver in sorted(os.listdir(lib_dir)):
         bundler_dir = osp.join(lib_dir, bundler_ver)
         if not osp.isdir(bundler_dir):
             continue                          # skip bundle.js, build.log, etc.
+        if not _bundler_matches(bundler_ver, bundler_filter):
+            continue
         graphs_dir = osp.join(bundler_dir, "graphs")
         if not osp.isdir(graphs_dir):
             continue
@@ -146,9 +180,11 @@ def _count_graphs_for_lib(lib_dir: str) -> int:
 
 def build_split_closed(
     data_dir: str,
-    train_ratio: float = 0.70,
-    val_ratio: float   = 0.15,
-    seed: int          = 42,
+    train_ratio: float      = 0.70,
+    val_ratio: float        = 0.15,
+    seed: int               = 42,
+    bundler_filter: List[str] = None,
+    lib_filter: List[str]   = None,
 ) -> Dict:
     """
     For each lib, shuffle all its graphs and assign them:
@@ -183,9 +219,12 @@ def build_split_closed(
     split_map: Dict[str, Dict[str, str]] = {}
     totals = {"train": 0, "val": 0, "test": 0}
 
+    lib_filter = lib_filter or []
     for lib in lib_dirs:
+        if not _lib_matches(lib, lib_filter):
+            continue
         lib_dir = osp.join(data_dir, lib)
-        graphs  = _all_graphs_for_lib(lib_dir)   # [(bundler_ver, fname), ...]
+        graphs  = _all_graphs_for_lib(lib_dir, bundler_filter=bundler_filter)
 
         if not graphs:
             print(f"  [WARN] {lib}: no graph files found — skipped")
@@ -226,10 +265,12 @@ def build_split_closed(
 
 def build_split_open(
     data_dir: str,
-    train_ratio: float  = 0.70,
-    val_ratio: float    = 0.15,
-    seed: int           = 42,
-    group_by_base: bool = True,
+    train_ratio: float      = 0.70,
+    val_ratio: float        = 0.15,
+    seed: int               = 42,
+    group_by_base: bool     = True,
+    bundler_filter: List[str] = None,
+    lib_filter: List[str]   = None,
 ) -> Dict[str, str]:
     """
     Assigns entire libs to train/val/test.
@@ -240,13 +281,15 @@ def build_split_open(
     """
     rng = random.Random(seed)
 
+    lib_filter = lib_filter or []
     lib_dirs = [
         d for d in sorted(os.listdir(data_dir))
-        if _is_lib_dir(d, data_dir)
+        if _is_lib_dir(d, data_dir) and _lib_matches(d, lib_filter)
     ]
     if not lib_dirs:
         raise RuntimeError(
             f"No lib directories found in data_dir: {data_dir}"
+            + (f" matching lib_filter={lib_filter}" if lib_filter else "")
         )
 
     # group by base name to avoid version leakage
@@ -259,8 +302,11 @@ def build_split_open(
     group_sizes: List[Tuple[int, str]] = sorted(
         [
             (
-                sum(_count_graphs_for_lib(osp.join(data_dir, m))
-                    for m in members),
+                sum(
+                    len(_all_graphs_for_lib(osp.join(data_dir, m),
+                                           bundler_filter=bundler_filter))
+                    for m in members
+                ),
                 base,
             )
             for base, members in groups.items()
@@ -303,7 +349,8 @@ def build_split_open(
     graph_counts = {"train": 0, "val": 0, "test": 0}
     for lib, sp in split_map.items():
         lib_counts[sp]   += 1
-        graph_counts[sp] += _count_graphs_for_lib(osp.join(data_dir, lib))
+        graph_counts[sp] += len(_all_graphs_for_lib(
+            osp.join(data_dir, lib), bundler_filter=bundler_filter))
 
     _print_summary("open", split_map.keys(), graph_counts, lib_counts)
     return split_map
@@ -362,6 +409,18 @@ def main():
              "(may allow version leakage — not recommended)",
     )
     parser.add_argument(
+        "--lib", nargs="+", default=[], metavar="LIB",
+        help="Lib versions to include. Accepts exact names "
+             "('axios@1.7.9') or base names ('axios'). "
+             "Multiple values allowed. Default: all libs.",
+    )
+    parser.add_argument(
+        "--bundler", nargs="+", default=[], metavar="BUNDLER",
+        help="Bundler versions to include. Accepts exact names "
+             "('rollup@4.46.2') or base names ('rollup'). "
+             "Multiple values allowed. Default: all bundlers.",
+    )
+    parser.add_argument(
         "--out", default=None,
         help="Output path for split.json (default: <raw_dir>/split.json)",
     )
@@ -383,21 +442,33 @@ def main():
     print(f"data_dir : {osp.abspath(data_dir)}")
     print(f"mode     : {args.mode}  |  seed={args.seed}  "
           f"|  train={args.train}  val={args.val}")
+    if args.lib:
+        print(f"libs     : {args.lib}")
+    else:
+        print("libs     : ALL (no filter)")
+    if args.bundler:
+        print(f"bundlers : {args.bundler}")
+    else:
+        print("bundlers : ALL (no filter)")
 
     if args.mode == "closed":
         result = build_split_closed(
-            data_dir    = data_dir,
-            train_ratio = args.train,
-            val_ratio   = args.val,
-            seed        = args.seed,
+            data_dir       = data_dir,
+            train_ratio    = args.train,
+            val_ratio      = args.val,
+            seed           = args.seed,
+            bundler_filter = args.bundler or None,
+            lib_filter     = args.lib or None,
         )
     else:
         result = build_split_open(
-            data_dir      = data_dir,
-            train_ratio   = args.train,
-            val_ratio     = args.val,
-            seed          = args.seed,
-            group_by_base = not args.no_group_versions,
+            data_dir       = data_dir,
+            train_ratio    = args.train,
+            val_ratio      = args.val,
+            seed           = args.seed,
+            group_by_base  = not args.no_group_versions,
+            bundler_filter = args.bundler or None,
+            lib_filter     = args.lib or None,
         )
 
     if args.dry_run:

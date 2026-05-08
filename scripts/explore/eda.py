@@ -4,22 +4,28 @@ eda.py — Exploratory Data Analysis for JSLibs CPG dataset
 Usage
 -----
 # Graphs in raw/ (original)
-python eda.py --raw_dir datasets/JSLibs/raw
+python scripts/explore/eda.py --raw_dir datasets/JSLibs/raw
 
 # Graphs in a separate data_dir
-python eda.py --raw_dir datasets/JSLibs/raw \
+python scripts/explore/eda.py --raw_dir datasets/JSLibs/raw \
               --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2
 
 # Filter to specific bundlers
-python eda.py --raw_dir datasets/JSLibs/raw \
+python scripts/explore/eda.py --raw_dir datasets/JSLibs/raw \
               --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
               --bundler rollup@4.46.2 webpack@5.95.0
+python scripts/explore/eda.py \
+    --raw_dir  datasets/JSLibs/raw \
+    --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
+    --lib   async axios lodash express chalk commander react request \
+    --bundler rollup@4.46.2 webpack@5.95.0 \
+    --save_dir scripts/plots/eda_output/
 
 # Only specific sections
-python eda.py --raw_dir datasets/JSLibs/raw --sections overview split sizes
+python scripts/explore/eda.py --raw_dir datasets/JSLibs/raw --sections overview split sizes
 
 # Save all figures
-python scripts/explore/eda.py --raw_dir datasets/JSLibs/raw --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 --save_dir scripts/explore/eda_output/ --bundler rollup@4.46.2
+python scripts/explore/eda.py --raw_dir datasets/JSLibs/raw --save_dir scripts/plots/eda_output/
 
 Sections
 --------
@@ -204,6 +210,16 @@ def _bundler_matches(bundler_ver: str, bundler_filter: list) -> bool:
     return bundler_ver in bundler_filter or bname in bundler_filter
 
 
+def _lib_matches(lib_ver: str, lib_filter: list) -> bool:
+    """True when lib_filter is empty or lib_ver matches an entry.
+    Supports exact ('axios@1.7.9') and base-name ('axios') matching."""
+    if not lib_filter:
+        return True
+    base = lib_ver.split("@")[0] if not lib_ver.startswith("@") \
+           else "@" + lib_ver.split("@")[1]
+    return lib_ver in lib_filter or base in lib_filter
+
+
 _BUNDLER_PREFIXES = ("rollup", "webpack", "vite",
                      "parcel", "esbuild", "browserify")
 
@@ -236,17 +252,20 @@ def _save_or_show(fig, save_dir: str, fname: str):
 # Section 1 — Overview
 # =============================================================================
 
-def section_overview(raw_dir: str, lib_split: dict, save_dir: str, helpers: dict = None, data_dir: str = None, bundler_filter: list = None):
+def section_overview(raw_dir: str, lib_split: dict, save_dir: str, helpers: dict = None, data_dir: str = None, bundler_filter: list = None, lib_filter: list = None):
     print(f"\n{SEP2}")
     print("  SECTION 1 — DIRECTORY OVERVIEW")
     print(SEP2)
 
     graph_root = data_dir or raw_dir
     bundler_filter = bundler_filter or []
+    lib_filter     = lib_filter or []
     rows = []
     for lib_ver in sorted(os.listdir(graph_root)):
         lib_dir = osp.join(graph_root, lib_ver)
         if not _is_lib_dir(lib_ver, graph_root):
+            continue
+        if not _lib_matches(lib_ver, lib_filter):
             continue
         for bundler_ver in sorted(os.listdir(lib_dir)):
             bundler_dir = osp.join(lib_dir, bundler_ver)
@@ -359,14 +378,17 @@ def section_split(rows: list, save_dir: str):
 
 def section_sizes(raw_dir: str, rows: list, save_dir: str,
                   sample_per_bundler: int = 40, helpers: dict = None,
-                  data_dir: str = None):
+                  data_dir: str = None, lib_filter: list = None):
     print(f"\n{SEP2}")
     print("  SECTION 3 — GRAPH SIZE DISTRIBUTION")
     print(SEP2)
     print(f"  (sampling up to {sample_per_bundler} graphs per lib×bundler combo)")
 
     size_rows = []
+    lib_filter = lib_filter or []
     for r in rows:
+        if not _lib_matches(r["lib_ver"], lib_filter):
+            continue
         graph_root = data_dir or raw_dir
         graphs_dir = osp.join(graph_root, r["lib_ver"], r["bundler_ver"], "graphs")
         if not osp.isdir(graphs_dir):
@@ -462,7 +484,8 @@ def section_sizes(raw_dir: str, rows: list, save_dir: str,
 # =============================================================================
 
 def section_edges(raw_dir: str, rows: list, save_dir: str,
-                  max_graphs: int = 200, data_dir: str = None):
+                  max_graphs: int = 200, data_dir: str = None,
+                  lib_filter: list = None):
     print(f"\n{SEP2}")
     print("  SECTION 4 — EDGE TYPE DISTRIBUTION")
     print(SEP2)
@@ -472,9 +495,12 @@ def section_edges(raw_dir: str, rows: list, save_dir: str,
     group_counter = Counter()
     sampled       = 0
 
+    lib_filter = lib_filter or []
     for r in rows:
         if sampled >= max_graphs:
             break
+        if not _lib_matches(r["lib_ver"], lib_filter):
+            continue
         graph_root = data_dir or raw_dir
         graphs_dir = osp.join(graph_root, r["lib_ver"], r["bundler_ver"], "graphs")
         if not osp.isdir(graphs_dir):
@@ -599,7 +625,8 @@ def section_vocab(raw_dir: str, save_dir: str):
 
 def section_graphs(raw_dir: str, rows: list, save_dir: str,
                    n_samples: int = 3, max_nodes: int = 80,
-                   helpers: dict = None, data_dir: str = None):
+                   helpers: dict = None, data_dir: str = None,
+                   lib_filter: list = None):
     print(f"\n{SEP2}")
     print("  SECTION 6 — SAMPLE GRAPH VISUALISATIONS")
     print(SEP2)
@@ -608,10 +635,13 @@ def section_graphs(raw_dir: str, rows: list, save_dir: str,
         print("  [SKIP] networkx and matplotlib both required.")
         return
 
+    lib_filter = lib_filter or []
     shown = 0
     for r in rows:
         if shown >= n_samples:
             break
+        if not _lib_matches(r["lib_ver"], lib_filter):
+            continue
         graph_root = data_dir or raw_dir
         graphs_dir = osp.join(graph_root, r["lib_ver"], r["bundler_ver"], "graphs")
         if not osp.isdir(graphs_dir):
@@ -714,6 +744,11 @@ def main():
                         help="Filter to specific bundler versions, e.g. "
                              "rollup@4.46.2 webpack@5.95.0. "
                              "Accepts exact or base names. Default: all.")
+    parser.add_argument("--lib",       nargs="+", default=[], metavar="LIB",
+                        help="Filter to specific lib versions, e.g. "
+                             "axios@1.7.9 lodash chalk@5.3.0. "
+                             "Accepts exact (axios@1.7.9) or base (axios) names. "
+                             "Default: all libs.")
     parser.add_argument("--sections",  nargs="+", default=ALL_SECTIONS,
                         choices=ALL_SECTIONS, metavar="SECTION",
                         help=f"Sections to run: {ALL_SECTIONS}")
@@ -736,8 +771,9 @@ def main():
     data_dir = args.data_dir or None
     if data_dir and not osp.isdir(data_dir):
         sys.exit(f"[ERROR] data_dir not found: {data_dir}")
-    graph_root = data_dir or args.raw_dir
+    graph_root     = data_dir or args.raw_dir
     bundler_filter = args.bundler or []
+    lib_filter     = args.lib or []
 
     split_json = osp.join(args.raw_dir, "split.json")
     if not osp.exists(split_json):
@@ -788,6 +824,7 @@ def main():
     print(f"  raw_dir   : {osp.abspath(args.raw_dir)}")
     print(f"  graph_root: {osp.abspath(graph_root)}")
     print(f"  bundlers  : {bundler_filter if bundler_filter else 'ALL'}")
+    print(f"  libs      : {lib_filter if lib_filter else 'ALL'}")
     print(f"  sections  : {args.sections}")
     print(SEP2)
 
@@ -802,12 +839,14 @@ def main():
     if "overview" in args.sections:
         rows = section_overview(args.raw_dir, lib_split, args.save_dir,
                                 helpers=helpers, data_dir=data_dir,
-                                bundler_filter=bundler_filter)
+                                bundler_filter=bundler_filter,
+                                lib_filter=lib_filter)
 
     if not rows:
         rows = section_overview(args.raw_dir, lib_split, save_dir="",
                                 helpers=helpers, data_dir=data_dir,
-                                bundler_filter=bundler_filter)
+                                bundler_filter=bundler_filter,
+                                lib_filter=lib_filter)
 
     if "split" in args.sections:
         section_split(rows, args.save_dir)
@@ -815,11 +854,13 @@ def main():
     if "sizes" in args.sections:
         section_sizes(args.raw_dir, rows, args.save_dir,
                       sample_per_bundler=args.sample_per_bundler,
-                      helpers=helpers, data_dir=data_dir)
+                      helpers=helpers, data_dir=data_dir,
+                      lib_filter=lib_filter)
 
     if "edges" in args.sections:
         section_edges(args.raw_dir, rows, args.save_dir,
-                      max_graphs=args.edge_sample, data_dir=data_dir)
+                      max_graphs=args.edge_sample, data_dir=data_dir,
+                      lib_filter=lib_filter)
 
     if "vocab" in args.sections:
         section_vocab(args.raw_dir, args.save_dir)  # vocab always in raw_dir
@@ -827,7 +868,8 @@ def main():
     if "graphs" in args.sections:
         section_graphs(args.raw_dir, rows, args.save_dir,
                        n_samples=args.n_samples, max_nodes=args.max_nodes,
-                       helpers=helpers, data_dir=data_dir)
+                       helpers=helpers, data_dir=data_dir,
+                       lib_filter=lib_filter)
 
     print(f"\n{SEP2}")
     print("  EDA complete.")

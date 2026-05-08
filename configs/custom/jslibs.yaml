@@ -1,12 +1,12 @@
 # ================================================================
 # GraphGPS — JS Library Obfuscation Detection
-# Run: python main.py --cfg configs/custom/libs_scan.yaml wandb.use False
+# Run: python main.py --cfg configs/custom/jslibs.yaml wandb.use False
 # ================================================================
 
 out_dir: results
 metric_best: accuracy-JS
 metric_agg: argmax
-name_tag: v3
+name_tag: v5
 
 wandb:
   use: False   # disable until pipeline is validated
@@ -30,6 +30,10 @@ dataset:
   split_index: 0
   split_mode: standard
   data_dir: /home/aiuser4/ado/bundled-js-scan/data/train/v2.2  # ← new
+  min_nodes: 5        # ← new
+  max_nodes: 2000     # ← new
+  bundler_filter: [rollup@4.46.2, webpack@5.95.0]  # e.g. [rollup@4.46.2, webpack@5.95.0] # ← new
+  lib_filter : [async, axios, lodash, express, chalk, commander, react, request, rxjs, uuid] # e.g. ['axios@1.7.9', 'lodash', 'chalk@5.3.0'] # ← new
 
 
 # ----------------------------------------------------------------

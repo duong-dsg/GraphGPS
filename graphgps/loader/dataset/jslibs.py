@@ -32,10 +32,6 @@ import torch
 import torch.nn as nn
 import xml.etree.ElementTree as ET
 from torch_geometric.data import Data, InMemoryDataset
-from torch_geometric.graphgym.register import (
-    register_edge_encoder,
-    register_node_encoder,
-)
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +50,16 @@ EDGE_GROUPS: Dict[str, int] = {
 }
 NUM_EDGE_GROUPS  = len(set(EDGE_GROUPS.values()))   # 6
 NODE_FEATURE_DIM = 128
+
+
+def _lib_matches(lib_ver: str, lib_filter: List[str]) -> bool:
+    """True when lib_filter is empty or lib_ver matches an entry.
+    Supports exact ('axios@1.7.9') and base-name ('axios') matching."""
+    if not lib_filter:
+        return True
+    base = ("@" + lib_ver.split("@")[1]
+            if lib_ver.startswith("@") else lib_ver.split("@")[0])
+    return lib_ver in lib_filter or base in lib_filter
 
 
 # =============================================================================
@@ -245,6 +251,8 @@ class JSLibsDataset(InMemoryDataset):
         min_nodes: int                     = 5,
         max_nodes: int                     = 2000,
         max_graphs_per_bundler: Optional[int] = None,
+        bundler_filter: Optional[List[str]]   = None,
+        lib_filter: Optional[List[str]]        = None,
         transform: Optional[Callable]      = None,
         pre_transform: Optional[Callable]  = None,
         pre_filter: Optional[Callable]     = None,
@@ -254,6 +262,14 @@ class JSLibsDataset(InMemoryDataset):
         # When set to a custom path, raw/ still holds split.json
         # and cpg_vocab.json; processed/ is under root as usual.
         self._data_dir              = data_dir   # None = use self.raw_dir
+        # bundler_filter: optional list of bundler@ver strings to include.
+        # e.g. ["rollup@4.46.2", "webpack@5.95.0"]
+        # None or [] = include all bundlers (original behaviour).
+        self._bundler_filter        = set(bundler_filter) if bundler_filter else None
+        # lib_filter: optional list of lib@ver strings to include.
+        # Supports exact ('axios@1.7.9') and base-name ('axios') matching.
+        # None or [] = include all libs (original behaviour).
+        self._lib_filter            = list(lib_filter) if lib_filter else None
         self.split_path             = split_path or osp.join(root, "raw", "split.json")
         self.min_nodes              = min_nodes
         self.max_nodes              = max_nodes
@@ -336,10 +352,60 @@ class JSLibsDataset(InMemoryDataset):
         graph_root = self.graph_dir
         log.info("Graph source directory: %s", graph_root)
         print(f"Graph source: {graph_root}")
+        if self._lib_filter:
+            print(f"Lib filter    : {sorted(self._lib_filter)}")
+        else:
+            print("Lib filter    : ALL (no filter)")
+        if self._bundler_filter:
+            print(f"Bundler filter: {sorted(self._bundler_filter)}")
+        else:
+            print("Bundler filter: ALL (no filter)")
+
+        # ── diagnostic: show first lib to help debug key mismatches ──────
+        dirs_on_disk  = sorted(d for d in os.listdir(graph_root)
+                               if osp.isdir(osp.join(graph_root, d)))
+        keys_in_split = sorted(lib_split.keys())
+        matched       = [d for d in dirs_on_disk if d in lib_split]
+        print(f"Libs on disk   : {len(dirs_on_disk)}  "
+              f"({dirs_on_disk[:3]}{'...' if len(dirs_on_disk)>3 else ''})")
+        print(f"Libs in split  : {len(keys_in_split)}  "
+              f"({keys_in_split[:3]}{'...' if len(keys_in_split)>3 else ''})")
+        print(f"Matched        : {len(matched)}")
+        if not matched:
+            print("\n[ERROR] No lib directories match split.json keys!")
+            print("  First 3 dirs on disk :", dirs_on_disk[:3])
+            print("  First 3 keys in split:", keys_in_split[:3])
+            print("  → Likely cause: split.json was built from a different"
+                  " data_dir or the paths inside split.json use a different"
+                  " bundler dir name than what is on disk.")
+
+        if mode == "closed":
+            # Show a sample key from split.json vs a sample path on disk
+            # so the user can spot the mismatch immediately.
+            sample_lib = keys_in_split[0] if keys_in_split else None
+            if sample_lib and isinstance(lib_split.get(sample_lib), dict):
+                sample_split_key = next(iter(lib_split[sample_lib]))
+                print(f"  sample split.json key : '{sample_lib}' → "
+                      f"'{sample_split_key}'")
+            if dirs_on_disk:
+                sample_disk_lib = matched[0] if matched else dirs_on_disk[0]
+                disk_lib_dir    = osp.join(graph_root, sample_disk_lib)
+                for bver in sorted(os.listdir(disk_lib_dir)):
+                    gdir = osp.join(disk_lib_dir, bver, "graphs")
+                    if osp.isdir(gdir):
+                        gfiles = _graph_files(gdir)
+                        if gfiles:
+                            print(f"  sample disk path      : '{sample_disk_lib}'"
+                                  f" → '{bver}/graphs/{gfiles[0]}'")
+                        break
 
         for lib_ver in sorted(os.listdir(graph_root)):
             lib_dir = osp.join(graph_root, lib_ver)
             if not osp.isdir(lib_dir):
+                continue
+            # ---- lib filter ----
+            if self._lib_filter and not _lib_matches(lib_ver, self._lib_filter):
+                log.debug("Skipping lib %s (not in lib_filter)", lib_ver)
                 continue
             if lib_ver not in lib_split:
                 stats["skip_not_in_split"] += 1
@@ -352,6 +418,14 @@ class JSLibsDataset(InMemoryDataset):
                 bundler_dir = osp.join(lib_dir, bundler_ver)
                 if not osp.isdir(bundler_dir):
                     continue           # skip bundle.js, build.log, etc.
+                # ---- bundler filter ----
+                if self._bundler_filter is not None:
+                    bname = bundler_ver.split("@")[0]   # base name
+                    if (bundler_ver not in self._bundler_filter
+                            and bname not in self._bundler_filter):
+                        log.debug("Skipping bundler %s (not in filter)",
+                                  bundler_ver)
+                        continue
                 graphs_dir = osp.join(bundler_dir, "graphs")
                 if not osp.isdir(graphs_dir):
                     continue

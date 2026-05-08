@@ -36,3 +36,19 @@ def dataset_cfg(cfg):
     # Graph size filters applied during JSLibsDataset.process().
     cfg.dataset.min_nodes = 5
     cfg.dataset.max_nodes = 2000
+
+    # Bundler filter: list of bundler@ver strings to include during
+    # dataset processing. Empty list = include all bundlers.
+    # Accepts exact names ('rollup@4.46.2') or base names ('rollup').
+    # Example in yaml:
+    #   dataset:
+    #     bundler_filter: ['rollup@4.46.2', 'webpack@5.95.0']
+    cfg.dataset.bundler_filter = []
+ 
+    # Lib filter: list of lib@ver strings to include during dataset
+    # processing. Empty list = include all libs.
+    # Accepts exact names ('axios@1.7.9') or base names ('axios').
+    # Example in yaml:
+    #   dataset:
+    #     lib_filter: ['axios@1.7.9', 'lodash', 'chalk@5.3.0']
+    cfg.dataset.lib_filter = []
