@@ -36,10 +36,10 @@ dataset:
   max_nodes: 2000     # ← new
   bundler_filter: [rollup@4.46.2, webpack@5.95.0]  # e.g. [rollup@4.46.2, webpack@5.95.0] # ← new
   lib_filter : [async, axios, lodash, express, chalk, commander, react, request, rxjs, uuid] # e.g. ['axios@1.7.9', 'lodash', 'chalk@5.3.0'] # ← new
-  graph_type: func  # ← func/entire: read per-function or entire graph then extract subgraphs in-memory
-  max_depth: None       # ← max depth for subgraph extraction (entire graph mode only)
-  closed_train_ratio: None
-  closed_val_ratio: None
+  graph_type: entire  # ← func/entire: read per-function or entire graph then extract subgraphs in-memory
+  max_depth: 3       # ← max depth for subgraph extraction (entire graph mode only)
+  closed_train_ratio: 0.70
+  closed_val_ratio: 0.15
 
 # ----------------------------------------------------------------
 # Positional Encoding — LapPE
