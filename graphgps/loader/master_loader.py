@@ -18,7 +18,8 @@ from graphgps.loader.dataset.aqsol_molecules import AQSOL
 from graphgps.loader.dataset.coco_superpixels import COCOSuperpixels
 from graphgps.loader.dataset.malnet_tiny import MalNetTiny
 from graphgps.loader.dataset.voc_superpixels import VOCSuperpixels
-from graphgps.loader.dataset.jslibs import JSLibsDataset  # new
+from graphgps.loader.dataset.jslibs import JSLibsDataset
+from graphgps.loader.dataset.jslibs_entire import JSLibsEntireDataset
 from graphgps.loader.split_generator import (prepare_splits,
                                              set_dataset_splits)
 from graphgps.transform.posenc_stats import compute_posenc_stats
@@ -697,13 +698,28 @@ def preformat_JSLibs(dataset_dir, name):
     logging.info("JSLibs: lib_filter     = %s",
                  lib_filter if lib_filter else "ALL")
  
-    dataset = JSLibsDataset(
-        root           = dataset_dir,    # raw/ and processed/ always here
-        data_dir       = data_dir,       # lib@ver/ graph dirs (None = use raw/)
+    graph_type = getattr(cfg.dataset, 'graph_type', 'func')
+    logging.info("JSLibs: graph_type = %s", graph_type)
+
+    if graph_type in ('entire', 'full'):
+        DatasetCls = JSLibsEntireDataset
+        extra_kwargs = {
+            'max_depth': getattr(cfg.dataset, 'max_depth', 3),
+            'closed_train_ratio': getattr(cfg.dataset, 'closed_train_ratio', 0.70),
+            'closed_val_ratio': getattr(cfg.dataset, 'closed_val_ratio', 0.15),
+        }
+    else:
+        DatasetCls = JSLibsDataset
+        extra_kwargs = {}
+
+    dataset = DatasetCls(
+        root           = dataset_dir,
+        data_dir       = data_dir,
         bundler_filter = bundler_filter or None,
         lib_filter     = lib_filter     or None,
         min_nodes      = getattr(cfg.dataset, "min_nodes", 5),
         max_nodes      = getattr(cfg.dataset, "max_nodes", 2000),
+        **extra_kwargs,
     )
     dataset.name = "JSLibs"
  

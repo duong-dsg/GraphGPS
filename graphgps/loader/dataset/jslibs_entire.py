@@ -1,33 +1,26 @@
 """
-graphgps/loader/dataset/jslibs.py
+graphgps/loader/dataset/jslibs_entire.py
 
-Loading strategy
-----------------
-Instead of reading one file per function, this version reads the single
-whole-program CPG (_program.xml or _program.dot) produced by the CPG
-extractor, locates every FUNCTION / METHOD entry node inside it, then
-extracts a k-hop ego-subgraph around each such node.
+Load whole-program CPG (_program.xml/_program.dot), extract k-hop ego
+subgraphs around function-entry nodes, and convert to PyG Data objects.
 
-Each extracted subgraph becomes one torch_geometric.data.Data object and
-is labelled with the parent library class index — exactly the same label
-space and split contract as before.
+Split modes
+-----------
+closed  {"axios@1.7.9": {"bundler@ver/graphs/_program.xml": "train", ...}}
+        → Same lib in train+val+test, different graphs.
+        → Subgraphs extracted from the same _program file are randomly
+          partitioned into train/val/test via _assign_subgraph_splits().
 
-Why this is better
-------------------
-* The whole-program CPG contains inter-function edges (CALL, CDG, REF, ...)
-  that are lost when each function is stored in isolation.  The k-hop window
-  captures local inter-function context without blowing up graph size.
-* No per-function file naming conventions to maintain.
-* max_depth controls the receptive field analogously to GNN depth, so the
-  hyperparameter has an interpretable meaning.
-
-Split schemas (unchanged from v1)
------------------------------------
-closed  {"axios@1.7.9": {"rollup@4.46.2/graphs/_program.xml": "train", ...}}
 open    {"axios@1.7.9": "train", ...}
+        → Each lib entirely in one split.
+        → All subgraphs from the same bundle share the bundle-level split.
 
-The split key lookup tries both ``_program.xml`` and ``_program.dot`` so
-either extension works.
+Key parameters
+--------------
+max_depth      : BFS hop radius (analogous to GNN layers)
+min_nodes      : drop subgraphs smaller than this
+max_nodes      : drop subgraphs larger than this
+closed_*_ratio : train/val split fractions for closed mode
 """
 
 from __future__ import annotations
@@ -36,6 +29,7 @@ import json
 import logging
 import os
 import os.path as osp
+import random
 from collections import deque
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -48,9 +42,13 @@ from torch_geometric.data import Data, InMemoryDataset
 log = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Constants
-# =============================================================================
+def _lib_matches(lib_ver: str, lib_filter: List[str]) -> bool:
+    if not lib_filter:
+        return True
+    base = ("@" + lib_ver.split("@")[1]
+            if lib_ver.startswith("@") else lib_ver.split("@")[0])
+    return lib_ver in lib_filter or base in lib_filter
+
 
 EDGE_GROUPS: Dict[str, int] = {
     "AST": 0,        "CONTAINS": 0,
@@ -60,13 +58,9 @@ EDGE_GROUPS: Dict[str, int] = {
     "CALL": 4,       "ARGUMENT": 4,   "PARAMETER_LINK": 4,
     "REF": 5,
 }
-NUM_EDGE_GROUPS  = len(set(EDGE_GROUPS.values()))   # 6
+NUM_EDGE_GROUPS  = len(set(EDGE_GROUPS.values()))
 NODE_FEATURE_DIM = 128
 
-# Node label substrings that identify function-entry nodes in a CPG.
-# Joern/codepropertygraph uses "METHOD"; some tools use "FUNCTION".
-# The check is case-insensitive substring match so "FunctionDeclaration"
-# and "method_definition" both match.
 FUNCTION_NODE_KEYWORDS: Tuple[str, ...] = (
     "METHOD",
     "FUNCTION",
@@ -75,13 +69,8 @@ FUNCTION_NODE_KEYWORDS: Tuple[str, ...] = (
     "FunctionExpression",
 )
 
-# File names (without directory) that carry the whole-program CPG.
 PROGRAM_FILE_STEMS: Tuple[str, ...] = ("_program",)
 
-
-# =============================================================================
-# Split schema detection
-# =============================================================================
 
 def detect_split_mode(lib_split: Dict) -> str:
     first = next(iter(lib_split.values()))
@@ -89,14 +78,8 @@ def detect_split_mode(lib_split: Dict) -> str:
         return "closed"
     if isinstance(first, str):
         return "open"
-    raise ValueError(
-        f"Unrecognised split.json schema — expected str or dict, got {type(first)}"
-    )
+    raise ValueError(f"Unrecognised split.json schema — expected str or dict, got {type(first)}")
 
-
-# =============================================================================
-# Graph I/O  (reads _program.* files only)
-# =============================================================================
 
 def _read_dot(path: str) -> nx.MultiDiGraph:
     graphs = pydot.graph_from_dot_file(path)
@@ -125,7 +108,6 @@ def _read_xml(path: str) -> nx.MultiDiGraph:
             return nx.MultiDiGraph(reader(path))
         except Exception:
             pass
-    # manual fallback
     G    = nx.MultiDiGraph()
     root = ET.parse(path).getroot()
     for node in root.findall(".//node"):
@@ -150,10 +132,6 @@ def _read_xml(path: str) -> nx.MultiDiGraph:
 
 
 def load_program_graph(graphs_dir: str) -> Tuple[Optional[nx.MultiDiGraph], Optional[str]]:
-    """
-    Look for a _program.xml or _program.dot file in graphs_dir.
-    Returns (graph, filename) or (None, None) if not found.
-    """
     for stem in PROGRAM_FILE_STEMS:
         for ext in (".xml", ".dot"):
             fname = stem + ext
@@ -166,16 +144,11 @@ def load_program_graph(graphs_dir: str) -> Tuple[Optional[nx.MultiDiGraph], Opti
                         return _read_xml(fpath), fname
                 except Exception as exc:
                     log.warning("Failed to parse %s: %s", fpath, exc)
-                    return None, fname   # file exists but broken
+                    return None, fname
     return None, None
 
 
-# =============================================================================
-# K-hop ego subgraph extraction
-# =============================================================================
-
 def _is_function_node(label: str) -> bool:
-    """Return True if node label indicates a function/method entry."""
     label_up = label.upper()
     return any(kw.upper() in label_up for kw in FUNCTION_NODE_KEYWORDS)
 
@@ -185,19 +158,8 @@ def _bfs_neighborhood(
     root: str,
     max_depth: int,
 ) -> Set[str]:
-    """
-    BFS on the *undirected* view of G (both in- and out-edges) up to max_depth
-    hops from root.  Returns the set of node ids in the neighborhood
-    (including root itself).
-
-    Using the undirected view ensures we capture upstream AST parents and
-    downstream CFG children with a single BFS, mirroring what a GNN with
-    bidirectional message-passing sees.
-    """
     visited: Set[str] = {root}
     queue: deque[Tuple[str, int]] = deque([(root, 0)])
-    # nx.MultiDiGraph.to_undirected() is expensive on large graphs;
-    # we iterate successors + predecessors manually instead.
     while queue:
         node, depth = queue.popleft()
         if depth >= max_depth:
@@ -216,32 +178,14 @@ def extract_function_subgraphs(
     min_nodes: int = 5,
     max_nodes: int = 2000,
 ) -> List[Tuple[str, nx.MultiDiGraph]]:
-    """
-    For each function-entry node in G, extract its k-hop ego subgraph.
-
-    Parameters
-    ----------
-    G          : whole-program CPG
-    max_depth  : BFS hop limit (analogous to number of GNN layers)
-    min_nodes  : drop subgraphs smaller than this
-    max_nodes  : drop subgraphs larger than this (degenerate whole-program nodes)
-
-    Returns
-    -------
-    List of (anchor_node_id, subgraph) pairs, one per function entry node
-    that passes the size filter.
-    """
     results: List[Tuple[str, nx.MultiDiGraph]] = []
 
-    # Collect function-entry nodes
     entry_nodes = [
         node for node, attr in G.nodes(data=True)
         if _is_function_node(attr.get("label", ""))
     ]
 
     if not entry_nodes:
-        # Fallback: if CPG has no recognisable function nodes, treat the
-        # entire graph as one subgraph so we never silently drop a bundle.
         log.debug("No function-entry nodes found — using whole graph as single subgraph")
         if min_nodes <= G.number_of_nodes() <= max_nodes:
             results.append(("__whole__", G))
@@ -258,19 +202,11 @@ def extract_function_subgraphs(
     return results
 
 
-# =============================================================================
-# Feature encoding  (unchanged from v1)
-# =============================================================================
-
 def _encode_nodes(
     G: nx.MultiDiGraph,
     node2id: Dict,
     vocab: Optional[Dict[str, int]] = None,
 ) -> torch.Tensor:
-    """
-    vocab provided  → [N, 1] long tensor  (for nn.Embedding)
-    vocab=None      → [N, NODE_FEATURE_DIM] float one-hot hash  (legacy)
-    """
     if vocab is not None:
         indices = [
             vocab.get(attr.get("label", "UNK"), 0)
@@ -321,17 +257,11 @@ def nx_to_pyg(
     if edge_index is None:
         return None
     return Data(
-        x          = x,
-        edge_index = edge_index,
-        edge_attr  = edge_attr,
-        num_nodes  = len(node2id),
-        y          = torch.tensor([label], dtype=torch.long),
+        x=x, edge_index=edge_index, edge_attr=edge_attr,
+        num_nodes=len(node2id),
+        y=torch.tensor([label], dtype=torch.long),
     )
 
-
-# =============================================================================
-# Helpers
-# =============================================================================
 
 def _split_bundler_ver(bundler_ver: str) -> Tuple[str, str]:
     if "@" in bundler_ver:
@@ -342,16 +272,10 @@ def _split_bundler_ver(bundler_ver: str) -> Tuple[str, str]:
 
 def _resolve_program_split_key(
     mode: str,
-    lib_info,           # str (open) or dict (closed)
+    lib_info,
     bundler_ver: str,
     fname: str,
 ) -> Optional[str]:
-    """
-    Open mode  : return the lib-level split string directly.
-    Closed mode: look up the _program file key in lib_info and return its
-                 split string.  Tries both .xml and .dot extensions.
-                 Returns None if the file is not listed in split.json.
-    """
     if mode == "open":
         key = lib_info if isinstance(lib_info, str) else None
     else:
@@ -375,41 +299,15 @@ def _resolve_program_split_key(
 def _assign_subgraph_splits(
     n_subgraphs: int,
     seed: int,
-    train_ratio: float = 0.7,
+    train_ratio: float = 0.70,
     val_ratio: float   = 0.15,
 ) -> List[str]:
-    """
-    Closed mode — post-extraction split assignment.
-
-    The _program file is a single atomic unit in split.json (one key → one
-    split label), so all its subgraphs would naively receive the same label,
-    making val/test sets empty.  Instead we randomly partition the subgraphs
-    extracted from *each* program file into train / val / test according to
-    configurable ratios.
-
-    Deterministic: seeded on (lib_idx * 1000 + bundler_hash) so the same
-    data always produces the same partition across re-runs.
-
-    Parameters
-    ----------
-    n_subgraphs  : number of subgraphs extracted from this program file
-    seed         : per-bundle integer seed for reproducibility
-    train_ratio  : fraction assigned to train  (default 0.70)
-    val_ratio    : fraction assigned to val    (default 0.15)
-                   remainder → test
-
-    Returns
-    -------
-    List[str] of length n_subgraphs, each element "train" | "val" | "test"
-    """
-    import random
     rng = random.Random(seed)
     indices = list(range(n_subgraphs))
     rng.shuffle(indices)
 
     n_train = max(1, int(n_subgraphs * train_ratio))
     n_val   = max(1, int(n_subgraphs * val_ratio))
-    # ensure we never exceed n_subgraphs
     if n_train + n_val >= n_subgraphs and n_subgraphs >= 3:
         n_val = 1
     if n_train + n_val >= n_subgraphs:
@@ -428,30 +326,7 @@ def _assign_subgraph_splits(
     return split_keys
 
 
-# =============================================================================
-# Dataset
-# =============================================================================
-
-class JSLibsDataset(InMemoryDataset):
-    """
-    Graph-classification dataset for JS library fingerprinting.
-
-    Each sample is a k-hop ego subgraph extracted from the whole-program CPG
-    (_program.xml / _program.dot), centred on a function-entry node.
-
-    Parameters
-    ----------
-    root                  : dataset root (processed/ lives here)
-    data_dir              : directory containing lib@ver/ subdirectories.
-                            Defaults to <root>/raw/.
-    split_path            : path to split.json
-    max_depth             : BFS hop radius for ego subgraph extraction
-    min_nodes             : minimum nodes per subgraph (smaller → dropped)
-    max_nodes             : maximum nodes per subgraph (larger → dropped)
-    max_graphs_per_bundler: cap the number of function subgraphs kept per
-                            bundler (useful for class-balance during debug)
-    """
-
+class JSLibsEntireDataset(InMemoryDataset):
     def __init__(
         self,
         root: str,
@@ -461,10 +336,12 @@ class JSLibsDataset(InMemoryDataset):
         min_nodes: int                        = 5,
         max_nodes: int                        = 2000,
         max_graphs_per_bundler: Optional[int] = None,
+        bundler_filter: Optional[List[str]]  = None,
+        lib_filter: Optional[List[str]]       = None,
         closed_train_ratio: float             = 0.70,
         closed_val_ratio: float               = 0.15,
         transform: Optional[Callable]         = None,
-        pre_transform: Optional[Callable]     = None,
+        pre_transform: Optional[Callable]       = None,
         pre_filter: Optional[Callable]        = None,
     ):
         self._data_dir              = data_dir
@@ -473,6 +350,8 @@ class JSLibsDataset(InMemoryDataset):
         self.min_nodes              = min_nodes
         self.max_nodes              = max_nodes
         self.max_graphs_per_bundler = max_graphs_per_bundler
+        self._bundler_filter        = set(bundler_filter) if bundler_filter else None
+        self._lib_filter            = list(lib_filter) if lib_filter else None
         self.closed_train_ratio     = closed_train_ratio
         self.closed_val_ratio       = closed_val_ratio
         super().__init__(root, transform, pre_transform, pre_filter)
@@ -498,12 +377,7 @@ class JSLibsDataset(InMemoryDataset):
     def download(self):
         pass
 
-    # ------------------------------------------------------------------ #
-    #  process                                                             #
-    # ------------------------------------------------------------------ #
-
     def process(self):
-        # ---- optional vocab ----
         vocab_path = osp.join(self.raw_dir, "cpg_vocab.json")
         vocab: Optional[Dict[str, int]] = None
         if osp.exists(vocab_path):
@@ -512,18 +386,16 @@ class JSLibsDataset(InMemoryDataset):
             log.info("Loaded CPG vocab: %d entries", len(vocab))
         else:
             log.warning(
-                "cpg_vocab.json not found — using hash node features.\n"
-                "Run: python -m graphgps.loader.dataset.cpg_vocab --raw_dir %s",
-                self.raw_dir,
+                "cpg_vocab.json not found at %s — using hash node features.",
+                vocab_path,
             )
 
-        # ---- split.json ----
         with open(self.split_path) as f:
             lib_split: Dict = json.load(f)
 
         mode = detect_split_mode(lib_split)
         log.info("Split mode: %s", mode)
-        print(f"[JSLibs] Split mode: {mode}  |  max_depth={self.max_depth}")
+        print(f"[jslibs_entire] Split mode: {mode}  |  max_depth={self.max_depth}")
 
         all_libs   = sorted(lib_split.keys())
         lib_to_idx = {lib: i for i, lib in enumerate(all_libs)}
@@ -533,22 +405,44 @@ class JSLibsDataset(InMemoryDataset):
         data_list:  List[Data]      = []
         split_dict: Dict[str, list] = {"train": [], "val": [], "test": []}
         stats = {
-            "bundles_seen":    0,
-            "bundles_no_prog": 0,   # no _program file found
-            "bundles_broken":  0,   # _program exists but parse failed
-            "subgraphs_total": 0,
-            "subgraphs_loaded":0,
-            "skip_size":       0,
-            "skip_empty":      0,
-            "skip_not_listed": 0,   # closed mode: graph key not in split.json
+            "bundles_seen":       0,
+            "bundles_no_prog":    0,
+            "bundles_broken":     0,
+            "subgraphs_total":   0,
+            "subgraphs_loaded":  0,
+            "skip_size":         0,
+            "skip_empty":        0,
+            "skip_not_listed":   0,
+            "skip_not_in_split": 0,
         }
 
         graph_root = self.graph_dir
-        print(f"[JSLibs] Graph source: {graph_root}")
+        print(f"[jslibs_entire] Graph source: {graph_root}")
+        if self._lib_filter:
+            print(f"[jslibs_entire] Lib filter   : {sorted(self._lib_filter)}")
+        else:
+            print("[jslibs_entire] Lib filter   : ALL")
+        if self._bundler_filter:
+            print(f"[jslibs_entire] Bundler filter: {sorted(self._bundler_filter)}")
+        else:
+            print("[jslibs_entire] Bundler filter: ALL")
+
+        dirs_on_disk  = sorted(d for d in os.listdir(graph_root)
+                               if osp.isdir(osp.join(graph_root, d)))
+        keys_in_split = sorted(lib_split.keys())
+        matched = [d for d in dirs_on_disk if d in lib_split]
+        print(f"[jslibs_entire] Libs on disk: {len(dirs_on_disk)}  "
+              f"in split: {len(keys_in_split)}  matched: {len(matched)}")
 
         for lib_ver in sorted(os.listdir(graph_root)):
             lib_dir = osp.join(graph_root, lib_ver)
-            if not osp.isdir(lib_dir) or lib_ver not in lib_split:
+            if not osp.isdir(lib_dir):
+                continue
+            if self._lib_filter and not _lib_matches(lib_ver, self._lib_filter):
+                log.debug("Skipping lib %s (not in lib_filter)", lib_ver)
+                continue
+            if lib_ver not in lib_split:
+                stats["skip_not_in_split"] += 1
                 continue
 
             lib_idx  = lib_to_idx[lib_ver]
@@ -558,6 +452,12 @@ class JSLibsDataset(InMemoryDataset):
                 bundler_dir = osp.join(lib_dir, bundler_ver)
                 if not osp.isdir(bundler_dir):
                     continue
+                if self._bundler_filter is not None:
+                    bname = bundler_ver.split("@")[0]
+                    if (bundler_ver not in self._bundler_filter
+                            and bname not in self._bundler_filter):
+                        log.debug("Skipping bundler %s (not in filter)", bundler_ver)
+                        continue
                 graphs_dir = osp.join(bundler_dir, "graphs")
                 if not osp.isdir(graphs_dir):
                     continue
@@ -565,7 +465,6 @@ class JSLibsDataset(InMemoryDataset):
                 stats["bundles_seen"] += 1
                 bundler_name, bundler_version = _split_bundler_ver(bundler_ver)
 
-                # ---- load whole-program CPG ----
                 G, prog_fname = load_program_graph(graphs_dir)
                 if prog_fname is None:
                     stats["bundles_no_prog"] += 1
@@ -577,9 +476,6 @@ class JSLibsDataset(InMemoryDataset):
                                 lib_ver, bundler_ver, prog_fname)
                     continue
 
-                # ---- open mode: resolve single split key for the whole bundle ----
-                # In open mode split.json assigns one split per lib, so every
-                # subgraph from this bundle shares the same label.
                 if mode == "open":
                     bundle_split_key = _resolve_program_split_key(
                         mode, lib_info, bundler_ver, prog_fname
@@ -588,12 +484,11 @@ class JSLibsDataset(InMemoryDataset):
                         stats["skip_not_listed"] += 1
                         continue
 
-                # ---- extract k-hop subgraphs per function node ----
                 subgraphs = extract_function_subgraphs(
                     G,
-                    max_depth = self.max_depth,
-                    min_nodes = self.min_nodes,
-                    max_nodes = self.max_nodes,
+                    max_depth=self.max_depth,
+                    min_nodes=self.min_nodes,
+                    max_nodes=self.max_nodes,
                 )
                 stats["subgraphs_total"] += len(subgraphs)
 
@@ -604,20 +499,15 @@ class JSLibsDataset(InMemoryDataset):
                 if n == 0:
                     continue
 
-                # ---- closed mode: assign train/val/test per subgraph ----
-                # split.json has one key per _program file, so using that key
-                # for all subgraphs would leave val/test empty.  Instead we
-                # randomly partition subgraphs from each bundle independently.
                 if mode == "closed":
                     bundle_seed = lib_idx * 10007 + hash(bundler_ver) % 9973
                     subgraph_splits = _assign_subgraph_splits(
                         n,
-                        seed        = bundle_seed,
-                        train_ratio = self.closed_train_ratio,
-                        val_ratio   = self.closed_val_ratio,
+                        seed=bundle_seed,
+                        train_ratio=self.closed_train_ratio,
+                        val_ratio=self.closed_val_ratio,
                     )
                 else:
-                    # open mode: all subgraphs share the bundle-level key
                     subgraph_splits = [bundle_split_key] * n
 
                 for (anchor_id, sub), split_key in zip(subgraphs, subgraph_splits):
@@ -629,7 +519,6 @@ class JSLibsDataset(InMemoryDataset):
                         stats["skip_empty"] += 1
                         continue
 
-                    # ---- metadata ----
                     data.lib_ver      = lib_ver
                     data.bundler_name = bundler_name
                     data.bundler_ver  = bundler_version
@@ -641,38 +530,25 @@ class JSLibsDataset(InMemoryDataset):
                     split_dict[split_key].append(graph_idx)
                     stats["subgraphs_loaded"] += 1
 
-                log.debug(
-                    "%s/%s: %d subgraphs → train=%d val=%d test=%d",
-                    lib_ver, bundler_ver, n,
-                    subgraph_splits.count("train"),
-                    subgraph_splits.count("val"),
-                    subgraph_splits.count("test"),
-                )
-
-        # ---- summary ----
         print(
-            f"[JSLibs] Loaded {stats['subgraphs_loaded']} subgraphs  "
+            f"[jslibs_entire] Loaded {stats['subgraphs_loaded']} subgraphs  "
             f"(train={len(split_dict['train'])}  "
             f"val={len(split_dict['val'])}  "
             f"test={len(split_dict['test'])})\n"
-            f"         bundles seen={stats['bundles_seen']}  "
-            f"no_program={stats['bundles_no_prog']}  "
-            f"broken={stats['bundles_broken']}  "
-            f"skip_not_listed={stats['skip_not_listed']}\n"
-            f"         subgraphs: total_extracted={stats['subgraphs_total']}  "
+            f"         bundles: seen={stats['bundles_seen']}  "
+            f"no_prog={stats['bundles_no_prog']}  "
+            f"broken={stats['bundles_broken']}\n"
+            f"         subgraphs: total={stats['subgraphs_total']}  "
             f"skip_size={stats['skip_size']}  "
             f"skip_empty={stats['skip_empty']}"
         )
 
         if not data_list:
             raise RuntimeError(
-                "No subgraphs loaded.  Checklist:\n"
+                "No subgraphs loaded. Check:\n"
                 "  1. <graph_dir>/lib@ver/bundler@ver/graphs/_program.xml exists\n"
-                "  2. split.json keys match lib@ver directory names exactly\n"
-                "  3. _program CPGs contain nodes with FUNCTION/METHOD labels\n"
-                f"  4. Split mode detected: '{mode}' — verify split.json schema\n"
-                f"  5. max_depth={self.max_depth}  min_nodes={self.min_nodes}  "
-                f"max_nodes={self.max_nodes}"
+                "  2. split.json keys match directory names\n"
+                "  3. max_depth/min_nodes/max_nodes filters"
             )
 
         if self.pre_filter is not None:
@@ -682,8 +558,6 @@ class JSLibsDataset(InMemoryDataset):
 
         torch.save(self.collate(data_list), self.processed_paths[0])
         torch.save(split_dict,              self.processed_paths[1])
-
-    # ------------------------------------------------------------------ #
 
     def get_idx_split(self) -> Dict[str, List[int]]:
         d = torch.load(self.processed_paths[1], weights_only=False)
@@ -702,21 +576,11 @@ class JSLibsDataset(InMemoryDataset):
         )
 
 
-# =============================================================================
-# Label map  (inference helper)
-# =============================================================================
-
 def build_label_map(split_json: str) -> Dict[int, str]:
-    """idx → lib@ver  (mirrors JSLibsDataset.process() ordering)."""
     with open(split_json) as f:
         lib_split = json.load(f)
     return {i: lib for i, lib in enumerate(sorted(lib_split.keys()))}
 
-
-# =============================================================================
-# Debug entry point
-# python -m graphgps.loader.dataset.jslibs
-# =============================================================================
 
 if __name__ == "__main__":
     import pprint
@@ -725,22 +589,22 @@ if __name__ == "__main__":
     ROOT = "datasets/JSLibs"
 
     print("=" * 60)
-    print("Loading dataset (k-hop subgraph mode)...")
+    print("Loading dataset (jslibs_entire mode)...")
     print("=" * 60)
 
     dataset = JSLibsDataset(
-        root       = ROOT,
-        data_dir   = "/home/aiuser4/ado/bundled-js-scan/data/train/v2.2",
-        split_path = osp.join(ROOT, "raw", "split.json"),
-        max_depth  = 3,
-        min_nodes  = 5,
-        max_nodes  = 500,
-        max_graphs_per_bundler = 20,
+        root=ROOT,
+        data_dir="/home/aiuser4/ado/bundled-js-scan/data/train/v2.2",
+        split_path=osp.join(ROOT, "raw", "split.json"),
+        max_depth=3,
+        min_nodes=5,
+        max_nodes=500,
+        max_graphs_per_bundler=20,
     )
 
     print(dataset)
-    print(f"Total subgraphs : {len(dataset)}")
-    print(f"Num classes     : {dataset.num_classes}")
+    print(f"Total subgraphs: {len(dataset)}")
+    print(f"Num classes: {dataset.num_classes}")
 
     split = dataset.get_idx_split()
     print("\nSplit sizes:")
@@ -748,26 +612,17 @@ if __name__ == "__main__":
 
     for name, idxs in split.items():
         if not idxs:
-            print(f"⚠️  {name.upper()} split is EMPTY — training will crash")
+            print(f"EMPTY {name.upper()} split!")
             continue
         ys = [dataset[i].y.item() for i in idxs]
         print(f"\n{name}: label distribution (top 10)")
         pprint.pprint(Counter(ys).most_common(10))
 
-    print("\n" + "=" * 60)
-    print("Sample subgraph [0]")
-    print("=" * 60)
     d = dataset[0]
-    print(f"lib_ver     : {d.lib_ver}")
-    print(f"anchor_node : {d.anchor_node}")
-    print(f"split       : {d.split}")
-    print(f"num_nodes   : {d.num_nodes}")
-    print(f"num_edges   : {d.edge_index.shape[1]}")
-    print(f"x shape     : {d.x.shape}")
-    print(f"edge_attr   : {d.edge_attr[:6]}")
-    print(f"unique edge groups : {set(d.edge_attr[:, 0].tolist())}")
+    print(f"\nSample[0]: lib_ver={d.lib_ver} anchor={d.anchor_node} split={d.split}")
+    print(f"num_nodes={d.num_nodes} num_edges={d.edge_index.shape[1]}")
 
-    assert len(split["train"]) > 0, "Train split empty!"
-    assert len(split["val"])   > 0, "Val split empty!"
-    assert len(split["test"])  > 0, "Test split empty!"
-    print("\n✅ All sanity checks passed")
+    assert len(split["train"]) > 0, "Train empty!"
+    assert len(split["val"])   > 0, "Val empty!"
+    assert len(split["test"])  > 0, "Test empty!"
+    print("\n All sanity checks passed")

@@ -331,9 +331,9 @@ def log_attn_weights(loggers, loaders, model, optimizer=None, scheduler=None):
 
     # The last loader is a test set.
     l = loaders[-1]
-    # To get a random sample, create a new loader that shuffles the test set.
+    num_workers = getattr(cfg, 'num_workers', 0)
     loader = DataLoader(l.dataset, batch_size=l.batch_size,
-                        shuffle=True, num_workers=0)
+                        shuffle=True, num_workers=num_workers)
 
     output = []
     # batch = next(iter(loader))  # Run one random batch.
