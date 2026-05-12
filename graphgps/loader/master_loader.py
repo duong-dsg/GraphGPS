@@ -692,35 +692,44 @@ def preformat_JSLibs(dataset_dir, name):
     # ── instantiate dataset ───────────────────────────────────────────────────
     bundler_filter = list(getattr(cfg.dataset, "bundler_filter", []) or [])
     lib_filter     = list(getattr(cfg.dataset, "lib_filter",     []) or [])
+    loader_type    = getattr(cfg.dataset, "loader_type", "individual")
  
+    logging.info("JSLibs: loader_type    = %s", loader_type)
     logging.info("JSLibs: bundler_filter = %s",
                  bundler_filter if bundler_filter else "ALL")
     logging.info("JSLibs: lib_filter     = %s",
                  lib_filter if lib_filter else "ALL")
  
-    graph_type = getattr(cfg.dataset, 'graph_type', 'func')
-    logging.info("JSLibs: graph_type = %s", graph_type)
-
-    if graph_type in ('entire', 'full'):
-        DatasetCls = JSLibsEntireDataset
-        extra_kwargs = {
-            'max_depth': getattr(cfg.dataset, 'max_depth', 3),
-            'closed_train_ratio': getattr(cfg.dataset, 'closed_train_ratio', 0.70),
-            'closed_val_ratio': getattr(cfg.dataset, 'closed_val_ratio', 0.15),
-        }
+    if loader_type == "entire":
+        # ── whole-program CPG + k-hop subgraph extraction ────────────────
+        max_depth     = getattr(cfg.dataset, "max_depth",     3)
+        max_gpb       = getattr(cfg.dataset, "max_graphs_per_bundler", 0)
+        closed_train  = getattr(cfg.dataset, "closed_train_ratio", 0.70)
+        closed_val    = getattr(cfg.dataset, "closed_val_ratio",   0.15)
+        logging.info("JSLibsEntire: max_depth=%d  max_gpb=%s",
+                     max_depth, max_gpb or 'unlimited')
+        dataset = JSLibsEntireDataset(
+            root                   = dataset_dir,
+            data_dir               = data_dir,
+            bundler_filter         = bundler_filter or None,
+            lib_filter             = lib_filter     or None,
+            max_depth              = max_depth,
+            min_nodes              = getattr(cfg.dataset, "min_nodes", 5),
+            max_nodes              = getattr(cfg.dataset, "max_nodes", 500),
+            max_graphs_per_bundler = max_gpb or None,
+            closed_train_ratio     = closed_train,
+            closed_val_ratio       = closed_val,
+        )
     else:
-        DatasetCls = JSLibsDataset
-        extra_kwargs = {}
-
-    dataset = DatasetCls(
-        root           = dataset_dir,
-        data_dir       = data_dir,
-        bundler_filter = bundler_filter or None,
-        lib_filter     = lib_filter     or None,
-        min_nodes      = getattr(cfg.dataset, "min_nodes", 5),
-        max_nodes      = getattr(cfg.dataset, "max_nodes", 2000),
-        **extra_kwargs,
-    )
+        # ── individual function graphs (original) ─────────────────────────
+        dataset = JSLibsDataset(
+            root           = dataset_dir,
+            data_dir       = data_dir,
+            bundler_filter = bundler_filter or None,
+            lib_filter     = lib_filter     or None,
+            min_nodes      = getattr(cfg.dataset, "min_nodes", 5),
+            max_nodes      = getattr(cfg.dataset, "max_nodes", 2000),
+        )
     dataset.name = "JSLibs"
  
     # ==========================================================================

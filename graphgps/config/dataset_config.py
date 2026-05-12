@@ -52,3 +52,25 @@ def dataset_cfg(cfg):
     #   dataset:
     #     lib_filter: ['axios@1.7.9', 'lodash', 'chalk@5.3.0']
     cfg.dataset.lib_filter = []
+
+    # ── JSLibsEntire (whole-program CPG + k-hop subgraph extraction) ─────────
+ 
+    # Which loader to use:
+#   'individual' → jslibs.py    (one graph per function file)
+#   'entire'     → jslibs_entire.py  (whole _program.xml + k-hop extraction)
+    cfg.dataset.loader_type = "individual"
+ 
+    # BFS hop radius for k-hop ego subgraph extraction around each
+    # function-entry node. Larger = more context but bigger graphs.
+    # Should roughly match gt.layers.
+    cfg.dataset.max_depth = 3
+ 
+    # Max subgraphs extracted per bundle (lib@ver + bundler@ver combo).
+    # 0 = no limit. Use a small int (e.g. 20) during debugging.
+    cfg.dataset.max_graphs_per_bundler = 0
+ 
+    # Closed-mode subgraph split ratios.
+    # Each _program file's subgraphs are randomly split into
+    # train/val/test independently of the lib-level split.
+    cfg.dataset.closed_train_ratio = 0.70
+    cfg.dataset.closed_val_ratio   = 0.15
