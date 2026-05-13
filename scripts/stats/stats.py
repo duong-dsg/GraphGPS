@@ -37,7 +37,7 @@ Usage
 python scripts/stats/stats.py --run_dir results/jslibs-v3
 
 # Save figures to disk
-python scripts/stats/stats.py --run_dir results/jslibs-v3 --save_dir plots/v3
+python scripts/stats/stats.py --run_dir results/jslibs-v6 --save_dir scripts/plots/v6
 
 # Compare multiple runs
 python scripts/stats/stats.py --run_dir results \\

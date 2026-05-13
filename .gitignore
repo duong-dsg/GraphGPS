@@ -3,6 +3,7 @@
 scripts/explore/eda_output/
 scripts/plots/
 AGENTS.md
+tmp/
 
 # CUSTOM
 .vscode/
