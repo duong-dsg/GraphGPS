@@ -257,6 +257,12 @@ class PrototypeInference:
         Find pre-extracted individual subgraph files (func_001.xml, etc.)
         for load_type='individual'.
 
+        Expected structure:
+            folder/
+                graphs/
+                    func001.xml
+                    func002.xml
+
         Returns list of (filename, filepath) tuples.
         """
         results = []
@@ -269,11 +275,13 @@ class PrototypeInference:
         if not osp.isdir(input_path):
             return results
 
+        graphs_dir = osp.join(input_path, "graphs")
+        if osp.isdir(graphs_dir):
+            input_path = graphs_dir
+
         for entry in os.listdir(input_path):
             entry_path = osp.join(input_path, entry)
-            if osp.isdir(entry_path):
-                results.extend(self._find_individual_files(entry_path))
-            elif entry.endswith((".xml", ".dot")) and "_program" not in entry and "Zone.Identifier" not in entry:
+            if osp.isfile(entry_path) and entry.endswith((".xml", ".dot")) and "_program" not in entry and "Zone.Identifier" not in entry:
                 results.append((entry, entry_path))
 
         return sorted(results)
