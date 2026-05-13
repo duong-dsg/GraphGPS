@@ -88,23 +88,24 @@ def supcon_loss(pred, true):
     Returns:
         loss, pred_scores (for logging)
     """
-    embeddings, labels = pred
+    if cfg.model.loss_fun == 'supcon':
+        embeddings, labels = pred
 
-    if labels is None:
-        # Labels should come from batch.y - they need to be passed differently
-        # In prototype head, we return (embeddings, labels) to this loss
-        # If we get None here, it means we're being called incorrectly
-        raise ValueError(
-            "SupCon loss requires labels to be passed as second element of pred tuple. "
-            "Ensure PrototypeHead returns (embeddings, labels) and train_epoch passes this."
+        if labels is None:
+            # Labels should come from batch.y - they need to be passed differently
+            # In prototype head, we return (embeddings, labels) to this loss
+            # If we get None here, it means we're being called incorrectly
+            raise ValueError(
+                "SupCon loss requires labels to be passed as second element of pred tuple. "
+                "Ensure PrototypeHead returns (embeddings, labels) and train_epoch passes this."
+            )
+
+        crit = SupConLoss(
+            temperature=getattr(cfg, 'loss.supcon_temperature', 0.07),
+            base_temperature=getattr(cfg, 'loss.supcon_base_temperature', 0.07)
         )
+        loss = crit(embeddings, labels)
 
-    crit = SupConLoss(
-        temperature=getattr(cfg, 'loss.supcon_temperature', 0.07),
-        base_temperature=getattr(cfg, 'loss.supcon_base_temperature', 0.07)
-    )
-    loss = crit(embeddings, labels)
-
-    # Return dummy pred_score for logging (CE-style expects [N, C] but we return [N])
-    pred_score = embeddings  # Use embeddings as proxy for logging
-    return loss, pred_score
+        # Return dummy pred_score for logging (CE-style expects [N, C] but we return [N])
+        pred_score = embeddings  # Use embeddings as proxy for logging
+        return loss, pred_score
