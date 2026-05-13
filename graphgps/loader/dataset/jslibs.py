@@ -52,13 +52,13 @@ NUM_EDGE_GROUPS  = len(set(EDGE_GROUPS.values()))   # 6
 NODE_FEATURE_DIM = 128
 
 
-def _lib_matches(lib_ver: str, lib_filter: List[str]) -> bool:
+def _lib_matches(lib_ver: str, lib_filter: List[str], spliter: str = "@") -> bool:
     """True when lib_filter is empty or lib_ver matches an entry.
     Supports exact ('axios@1.7.9') and base-name ('axios') matching."""
     if not lib_filter:
         return True
-    base = ("@" + lib_ver.split("@")[1]
-            if lib_ver.startswith("@") else lib_ver.split("@")[0])
+    base = (spliter + lib_ver.split(spliter)[1]
+            if lib_ver.startswith(spliter) else lib_ver.split(spliter)[0])
     return lib_ver in lib_filter or base in lib_filter
 
 
@@ -252,7 +252,8 @@ class JSLibsDataset(InMemoryDataset):
         max_nodes: int                     = 2000,
         max_graphs_per_bundler: Optional[int] = None,
         bundler_filter: Optional[List[str]]   = None,
-        lib_filter: Optional[List[str]]        = None,
+        lib_filter: Optional[List[str]]       = None,
+        spliter: Optional[str]             = "@",
         transform: Optional[Callable]      = None,
         pre_transform: Optional[Callable]  = None,
         pre_filter: Optional[Callable]     = None,
@@ -270,6 +271,7 @@ class JSLibsDataset(InMemoryDataset):
         # Supports exact ('axios@1.7.9') and base-name ('axios') matching.
         # None or [] = include all libs (original behaviour).
         self._lib_filter            = list(lib_filter) if lib_filter else None
+        self.spliter                = spliter
         self.split_path             = split_path or osp.join(root, "raw", "split.json")
         self.min_nodes              = min_nodes
         self.max_nodes              = max_nodes
@@ -404,7 +406,7 @@ class JSLibsDataset(InMemoryDataset):
             if not osp.isdir(lib_dir):
                 continue
             # ---- lib filter ----
-            if self._lib_filter and not _lib_matches(lib_ver, self._lib_filter):
+            if self._lib_filter and not _lib_matches(lib_ver, self._lib_filter, spliter=self.spliter):
                 log.debug("Skipping lib %s (not in lib_filter)", lib_ver)
                 continue
             if lib_ver not in lib_split:
@@ -420,7 +422,7 @@ class JSLibsDataset(InMemoryDataset):
                     continue           # skip bundle.js, build.log, etc.
                 # ---- bundler filter ----
                 if self._bundler_filter is not None:
-                    bname = bundler_ver.split("@")[0]   # base name
+                    bname = bundler_ver.split(self.spliter)[0]   # base name
                     if (bundler_ver not in self._bundler_filter
                             and bname not in self._bundler_filter):
                         log.debug("Skipping bundler %s (not in filter)",

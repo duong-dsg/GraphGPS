@@ -72,10 +72,10 @@ Usage
 
     python graphgps/loader/dataset/build_split.py \
     --raw_dir  datasets/JSLibs/raw \
-    --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
+    --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2 \
     --mode closed --seed 42 \
-    --lib   async axios lodash express chalk commander react request rxjs uuid \
-    --bundler rollup@4.46.2 webpack@5.95.0
+    --bundler rollup_4.46.2 webpack_5.95.0 \
+    --spliter _
 """
 
 import argparse
@@ -108,13 +108,13 @@ def _is_lib_dir(name: str, parent: str) -> bool:
     return True
 
 
-def _lib_matches(lib_ver: str, lib_filter: list) -> bool:
+def _lib_matches(lib_ver: str, lib_filter: list, spliter="@") -> bool:
     """True when lib_filter is empty or lib_ver matches an entry.
     Supports exact ('axios@1.7.9') and base-name ('axios') matching."""
     if not lib_filter:
         return True
-    base = lib_ver.split("@")[0] if not lib_ver.startswith("@") \
-           else "@" + lib_ver.split("@")[1]
+    base = lib_ver.split(spliter)[0] if not lib_ver.startswith(spliter) \
+           else spliter + lib_ver.split(spliter)[1]
     return lib_ver in lib_filter or base in lib_filter
 
 
@@ -185,6 +185,7 @@ def build_split_closed(
     seed: int               = 42,
     bundler_filter: List[str] = None,
     lib_filter: List[str]   = None,
+    spliter: str             = "@",
 ) -> Dict:
     """
     For each lib, shuffle all its graphs and assign them:
@@ -221,7 +222,7 @@ def build_split_closed(
 
     lib_filter = lib_filter or []
     for lib in lib_dirs:
-        if not _lib_matches(lib, lib_filter):
+        if not _lib_matches(lib, lib_filter, spliter=spliter):
             continue
         lib_dir = osp.join(data_dir, lib)
         graphs  = _all_graphs_for_lib(lib_dir, bundler_filter=bundler_filter)
@@ -428,6 +429,12 @@ def main():
         "--dry_run", action="store_true",
         help="Print summary without writing file",
     )
+
+    parser.add_argument(
+        "--spliter", default="@",
+        help="Split character for lib@version format (default: @)",
+    )
+
     args = parser.parse_args()
 
     # resolve data_dir — default to raw_dir (original behaviour)
@@ -459,6 +466,7 @@ def main():
             seed           = args.seed,
             bundler_filter = args.bundler or None,
             lib_filter     = args.lib or None,
+            spliter        = "@" if not args.spliter else None,
         )
     else:
         result = build_split_open(
