@@ -7,9 +7,10 @@ subgraphs around function-entry nodes, and convert to PyG Data objects.
 Split modes
 -----------
 closed  {"axios@1.7.9": {"bundler@ver/graphs/_program.xml": "train", ...}}
-        → Same lib in train+val+test, different graphs.
-        → Subgraphs extracted from the same _program file are randomly
-          partitioned into train/val/test via _assign_subgraph_splits().
+        → Same lib in train+val+test, different graphs (bundler split).
+        → ALL subgraphs from the same bundle get the SAME split key
+           (bundle-level split, not random partition per subgraph).
+        → This prevents within-bundler data leakage.
 
 open    {"axios@1.7.9": "train", ...}
         → Each lib entirely in one split.
@@ -20,7 +21,6 @@ Key parameters
 max_depth      : BFS hop radius (analogous to GNN layers)
 min_nodes      : drop subgraphs smaller than this
 max_nodes      : drop subgraphs larger than this
-closed_*_ratio : train/val split fractions for closed mode
 """
 
 from __future__ import annotations
@@ -270,12 +270,20 @@ def _split_bundler_ver(bundler_ver: str) -> Tuple[str, str]:
     return bundler_ver, ""
 
 
-def _resolve_program_split_key(
+def _get_bundle_split_key(
     mode: str,
     lib_info,
     bundler_ver: str,
     fname: str,
 ) -> Optional[str]:
+    """
+    Get the split key for ALL subgraphs from a bundle (bundle-level split).
+
+    For open mode: return the lib-level split string directly.
+    For closed mode: look up the _program file key in lib_info and return its
+    split string. This assigns the SAME split to ALL subgraphs from this bundle,
+    preventing within-bundler data leakage.
+    """
     if mode == "open":
         key = lib_info if isinstance(lib_info, str) else None
     else:
@@ -294,36 +302,6 @@ def _resolve_program_split_key(
     if key is None:
         return None
     return "val" if key in ("valid", "val") else key
-
-
-def _assign_subgraph_splits(
-    n_subgraphs: int,
-    seed: int,
-    train_ratio: float = 0.70,
-    val_ratio: float   = 0.15,
-) -> List[str]:
-    rng = random.Random(seed)
-    indices = list(range(n_subgraphs))
-    rng.shuffle(indices)
-
-    n_train = max(1, int(n_subgraphs * train_ratio))
-    n_val   = max(1, int(n_subgraphs * val_ratio))
-    if n_train + n_val >= n_subgraphs and n_subgraphs >= 3:
-        n_val = 1
-    if n_train + n_val >= n_subgraphs:
-        n_train = n_subgraphs - 1
-        n_val   = 0
-
-    split_keys = [""] * n_subgraphs
-    for rank, orig_idx in enumerate(indices):
-        if rank < n_train:
-            split_keys[orig_idx] = "train"
-        elif rank < n_train + n_val:
-            split_keys[orig_idx] = "val"
-        else:
-            split_keys[orig_idx] = "test"
-
-    return split_keys
 
 
 class JSLibsEntireDataset(InMemoryDataset):
@@ -476,13 +454,12 @@ class JSLibsEntireDataset(InMemoryDataset):
                                 lib_ver, bundler_ver, prog_fname)
                     continue
 
-                if mode == "open":
-                    bundle_split_key = _resolve_program_split_key(
-                        mode, lib_info, bundler_ver, prog_fname
-                    )
-                    if bundle_split_key not in VALID_SPLITS:
-                        stats["skip_not_listed"] += 1
-                        continue
+                bundle_split_key = _get_bundle_split_key(
+                    mode, lib_info, bundler_ver, prog_fname
+                )
+                if bundle_split_key not in VALID_SPLITS:
+                    stats["skip_not_listed"] += 1
+                    continue
 
                 subgraphs = extract_function_subgraphs(
                     G,
@@ -499,16 +476,7 @@ class JSLibsEntireDataset(InMemoryDataset):
                 if n == 0:
                     continue
 
-                if mode == "closed":
-                    bundle_seed = lib_idx * 10007 + hash(bundler_ver) % 9973
-                    subgraph_splits = _assign_subgraph_splits(
-                        n,
-                        seed=bundle_seed,
-                        train_ratio=self.closed_train_ratio,
-                        val_ratio=self.closed_val_ratio,
-                    )
-                else:
-                    subgraph_splits = [bundle_split_key] * n
+                subgraph_splits = [bundle_split_key] * n
 
                 for (anchor_id, sub), split_key in zip(subgraphs, subgraph_splits):
                     if split_key not in VALID_SPLITS:

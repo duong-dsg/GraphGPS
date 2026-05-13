@@ -10,6 +10,7 @@ from torch_geometric.graphgym.register import register_train
 from torch_geometric.graphgym.utils.epoch import is_eval_epoch, is_ckpt_epoch
 
 from graphgps.loss.subtoken_prediction_loss import subtoken_cross_entropy
+from graphgps.head.prototype_head import PrototypeHead, PrototypeLinearHead
 from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name
 
 
@@ -561,13 +562,124 @@ def jslibs_inference(loggers, loaders, model, optimizer=None, scheduler=None):
         label_map   = label_map,
         aggregation = aggregation,
     )
- 
+
     _print_predictions(preds, title=f"JSLibs Detection  [{aggregation}]")
- 
-    # ---- Save JSON ----
+
     if not output_json:
         output_json = osp.join(cfg.run_dir, 'jslibs_predictions.json')
     Path(output_json).parent.mkdir(parents=True, exist_ok=True)
     Path(output_json).write_text(json.dumps(preds, indent=2))
     logging.info(f"[JSLibs] Predictions saved → {output_json}")
     logging.info(f"[JSLibs] Done in {time.perf_counter() - start_time:.2f}s")
+
+
+@register_train('jslibs-prototype-inference')
+def jslibs_prototype_inference(loggers, loaders, model, optimizer=None, scheduler=None):
+    """
+    Prototype-based inference for JSLibs library detection.
+
+    At inference time:
+    - Query subgraph embeddings → cosine similarity to class prototypes
+    - Return top-k libraries by similarity score
+
+    Required cfg keys (under `jslibs:` block):
+        jslibs:
+          split_json:  datasets/JSLibs/raw/split.json
+          prototypes_path: path to save/load prototype embeddings
+          topk:        5
+          threshold:   0.5   # minimum cosine similarity to consider a match
+    """
+    start_time = time.perf_counter()
+    device = torch.device(cfg.accelerator)
+
+    split_json    = getattr(cfg, 'jslibs', {}).get(
+        'split_json', osp.join(cfg.dataset.dir, 'raw', 'split.json'))
+    prototypes_path = getattr(cfg, 'jslibs', {}).get('prototypes_path', '')
+    topk           = getattr(cfg, 'jslibs', {}).get('topk', 5)
+    threshold      = getattr(cfg, 'jslibs', {}).get('threshold', 0.5)
+
+    if not osp.isfile(split_json):
+        raise FileNotFoundError(
+            f"split.json not found at '{split_json}'. "
+            "Set jslibs.split_json in your config."
+        )
+
+    label_map = _build_label_map(split_json)
+    num_classes = len(label_map)
+    logging.info(f"[JSLibs-Proto] {num_classes} library classes loaded from {split_json}")
+    logging.info(f"[JSLibs-Proto] Top-K: {topk} | Threshold: {threshold}")
+
+    head = None
+    if hasattr(model, 'head') and isinstance(model.head, (PrototypeHead, PrototypeLinearHead)):
+        head = model.head
+    elif hasattr(model, 'model') and hasattr(model.model, 'head'):
+        if isinstance(model.model.head, (PrototypeHead, PrototypeLinearHead)):
+            head = model.model.head
+
+    if head is None:
+        raise RuntimeError(
+            "Prototype-based inference requires model head to be 'prototype' or 'prototype_linear'. "
+            "Set model.gnn.head: prototype in your config."
+        )
+
+    if not head.prototypes_updated:
+        logging.info("[JSLibs-Proto] Computing prototypes from train embeddings...")
+        train_loader = loaders[0]
+        model.eval()
+        with torch.no_grad():
+            for batch in train_loader:
+                batch.to(device)
+                embeddings, labels = head(batch)
+                head.update_prototypes(embeddings, labels)
+        head.compute_prototypes()
+        logging.info("[JSLibs-Proto] Prototypes computed.")
+
+    if prototypes_path:
+        torch.save({
+            'prototypes': head.get_prototypes(),
+            'label_map': label_map,
+        }, prototypes_path)
+        logging.info(f"[JSLibs-Proto] Prototypes saved to {prototypes_path}")
+
+    inference_loader = loaders[-1]
+    logging.info(f"[JSLibs-Proto] Running inference on {len(inference_loader.dataset)} graphs")
+
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for batch in inference_loader:
+            batch.to(device)
+            embeddings, _ = head(batch)
+            preds = head.predict(embeddings, topk=topk, threshold=threshold)
+            all_preds.extend(preds)
+
+    agg_scores = torch.zeros(num_classes, device=device)
+    for pred in all_preds:
+        for lib_idx, score in pred['topk']:
+            agg_scores[lib_idx] += score
+
+    topk_scores, topk_idx = torch.topk(agg_scores.cpu(), k=min(topk, num_classes))
+    display_conf = torch.softmax(topk_scores.float(), dim=0).tolist()
+
+    results = []
+    for rank, (idx, score, conf) in enumerate(
+        zip(topk_idx.tolist(), topk_scores.tolist(), display_conf), start=1
+    ):
+        results.append({
+            "rank":        rank,
+            "lib":         label_map[idx],
+            "score":       round(score, 4),
+            "confidence":  round(conf, 4),
+        })
+
+    _print_predictions(results, title=f"JSLibs Prototype Inference")
+
+    if not prototypes_path:
+        prototypes_path = osp.join(cfg.run_dir, 'jslibs_prototypes.pt')
+    Path(prototypes_path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'prototypes': head.get_prototypes(),
+        'label_map': label_map,
+    }, prototypes_path)
+    logging.info(f"[JSLibs-Proto] Prototypes saved → {prototypes_path}")
+    logging.info(f"[JSLibs-Proto] Done in {time.perf_counter() - start_time:.2f}s")
