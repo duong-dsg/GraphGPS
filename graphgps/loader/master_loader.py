@@ -729,6 +729,7 @@ def preformat_JSLibs(dataset_dir, name):
             lib_filter     = lib_filter     or None,
             min_nodes      = getattr(cfg.dataset, "min_nodes", 5),
             max_nodes      = getattr(cfg.dataset, "max_nodes", 2000),
+            spliter        = getattr(cfg.dataset, "spliter", "@")
         )
     dataset.name = "JSLibs"
  

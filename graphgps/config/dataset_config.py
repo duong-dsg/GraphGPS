@@ -74,3 +74,6 @@ def dataset_cfg(cfg):
     # train/val/test independently of the lib-level split.
     cfg.dataset.closed_train_ratio = 0.70
     cfg.dataset.closed_val_ratio   = 0.15
+
+    # Spliter for lib and bundler names in the JSLibs dataset
+    cfg.dataset.spliter = "@"
