@@ -618,7 +618,7 @@ def compute_prototypes_from_data(
     Args:
         data_path: Path to data.pt (contains (Data, dict) tuple from PyG InMemoryDataset)
         split_dict_path: Path to split_dict.pt (contains train/val/test indices)
-        model_path: Path to model checkpoint (.pt)
+        model_path: Path to model checkpoint (.pt) OR already-instantiated model object
         output_path: Path to save prototypes.pt
         split_json: Path to split.json for label_map (auto-detected if not provided)
         device: Device to run on
@@ -660,34 +660,38 @@ def compute_prototypes_from_data(
         label_map = {i: lib for i, lib in enumerate(all_libs)}
         log.info("Loaded label_map from split.json: %d classes", len(label_map))
     else:
-        num_classes = int(labels.max()) + 1
-        label_map = {i: str(i) for i in range(num_classes)}
+        num_classes_estimate = int(labels.max()) + 1
+        label_map = {i: str(i) for i in range(num_classes_estimate)}
         log.warning("split.json not found at %s, using numeric label_map", split_json)
 
     num_classes = len(label_map)
-    log.info("Loading model from %s", model_path)
-    ckpt = torch.load(model_path, map_location=device, weights_only=False)
 
-    if isinstance(ckpt, dict):
-        log.info("Checkpoint keys: %s", list(ckpt.keys()))
-        if "model" in ckpt:
-            model = ckpt["model"]
-        elif "encoder" in ckpt:
-            model = ckpt["encoder"]
-        else:
-            for k, v in ckpt.items():
-                if isinstance(v, torch.nn.Module):
-                    model = v
-                    break
-            else:
+    if isinstance(model_path, str):
+        log.info("Loading model from %s", model_path)
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
+
+        if isinstance(ckpt, dict) and "model_state" in ckpt:
+            log.warning("Checkpoint contains state_dict. You must provide a model instance, not a path.")
+            raise TypeError(
+                "Checkpoint only contains state_dict. Pass an instantiated model object instead of a path. "
+                "Example: model = GPSModel(dim_in=128, dim_out=128); "
+                "model.load_state_dict(torch.load(path, weights_only=False)['model_state'])"
+            )
+
+        if isinstance(ckpt, dict):
+            if "model" in ckpt and hasattr(ckpt["model"], "__call__"):
+                model = ckpt["model"]
+            elif hasattr(ckpt, "__call__"):
                 model = ckpt
+            else:
+                model = ckpt.get("model", ckpt)
+        else:
+            model = ckpt
     else:
-        model = ckpt
+        log.info("Using provided model object: %s", type(model_path))
+        model = model_path
 
-    log.info("Model type: %s, callable: %s", type(model), callable(model))
-
-    if isinstance(model, dict):
-        raise TypeError(f"Model extracted as dict: {model.keys()}. Check checkpoint structure.")
+    log.info("Model type: %s", type(model))
 
     num_classes = len(label_map)
     embedding_dim = 128
