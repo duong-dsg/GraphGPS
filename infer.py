@@ -7,30 +7,28 @@ from graphgps.network.gps_model import GPSModel
 if __name__ == "__main__":
     import torch
     from yacs.config import CfgNode
-    from torch_geometric.graphgym.config import set_cfg
+    from torch_geometric.graphgym.config import set_cfg, cfg
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     prototype_path = "results/jslibs-10libs-hash/prototypes.pt"
     model_path = "results/jslibs-10libs-hash/0/ckpt/192.ckpt"
 
-    # Step 1: Set up cfg for model instantiation (required by GPSModel)
-    _cfg = CfgNode()
-    set_cfg(_cfg)
-    _cfg.gnn.dim_inner = 128
-    _cfg.gt.dim_hidden = 128
-    _cfg.gt.layer_type = 'GatedGCN+Transformer'
-    _cfg.gt.layers = 6
-    _cfg.gt.n_heads = 8
-    _cfg.gt.dropout = 0.0
-    _cfg.gt.attn_dropout = 0.0
-    _cfg.gt.layer_norm = True
-    _cfg.gt.batch_norm = False
-    _cfg.gt.pna_degrees = [4]
-    _cfg.gt.bigbird = {}
-    _cfg.gnn.layers_pre_mp = 0
-    _cfg.gnn.head = 'prototype'
-    _cfg.dataset.node_encoder = False
-    _cfg.dataset.edge_encoder = False
+    # Step 1: Set up global cfg for GPSModel (GPSModel reads from global cfg)
+    set_cfg(cfg)
+    cfg.gnn.dim_inner = 128
+    cfg.gt.dim_hidden = 128
+    cfg.gt.layer_type = 'GatedGCN+Transformer'
+    cfg.gt.layers = 6
+    cfg.gt.n_heads = 8
+    cfg.gt.dropout = 0.0
+    cfg.gt.attn_dropout = 0.0
+    cfg.gt.layer_norm = True
+    cfg.gt.batch_norm = False
+    cfg.gt.pna_degrees = [4]
+    cfg.gnn.layers_pre_mp = 0
+    cfg.gnn.head = 'prototype'
+    cfg.dataset.node_encoder = False
+    cfg.dataset.edge_encoder = False
 
     # Step 2: Instantiate model and load state_dict
     model = GPSModel(dim_in=128, dim_out=128)
