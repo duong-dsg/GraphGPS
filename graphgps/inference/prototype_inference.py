@@ -609,7 +609,7 @@ def compute_prototypes_from_data(
     split_dict_path: str,
     model_path: str,
     output_path: str,
-    label_map: Optional[Dict[int, str]] = None,
+    split_json: Optional[str] = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     """
@@ -620,7 +620,7 @@ def compute_prototypes_from_data(
         split_dict_path: Path to split_dict.pt (contains train/val/test indices)
         model_path: Path to model checkpoint (.pt)
         output_path: Path to save prototypes.pt
-        label_map: Optional dict mapping class idx → library name
+        split_json: Path to split.json for label_map (auto-detected if not provided)
         device: Device to run on
 
     Data format:
@@ -651,6 +651,20 @@ def compute_prototypes_from_data(
     else:
         raise ValueError(f"split_dict missing 'train' key. Keys: {split_dict.keys()}")
 
+    if split_json is None:
+        split_json = osp.join(osp.dirname(data_path), "..", "raw", "split.json")
+    if osp.exists(split_json):
+        with open(split_json) as f:
+            lib_split = json.load(f)
+        all_libs = sorted(lib_split.keys())
+        label_map = {i: lib for i, lib in enumerate(all_libs)}
+        log.info("Loaded label_map from split.json: %d classes", len(label_map))
+    else:
+        num_classes = int(labels.max()) + 1
+        label_map = {i: str(i) for i in range(num_classes)}
+        log.warning("split.json not found at %s, using numeric label_map", split_json)
+
+    num_classes = len(label_map)
     log.info("Loading model from %s", model_path)
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
     model = ckpt.get("model", ckpt)
@@ -659,7 +673,7 @@ def compute_prototypes_from_data(
     if hasattr(model, "eval"):
         model.eval()
 
-    num_classes = int(labels.max()) + 1
+    num_classes = len(label_map)
     embedding_dim = 128
 
     if hasattr(model, "model") and hasattr(model.model, "dim_inner"):
@@ -765,10 +779,6 @@ def compute_prototypes_from_data(
             log.warning("No support embeddings for class %d", c)
 
     log.info("Computed %d valid prototypes (out of %d classes)", valid_classes, num_classes)
-
-    if label_map is None:
-        unique_labels = sorted(set(labels[train_indices]))
-        label_map = {i: str(i) for i in range(num_classes)}
 
     torch.save({
         'prototypes': prototypes,
