@@ -90,7 +90,14 @@ class PrototypeInference:
         self.device = torch.device(device)
 
         self.model = self._load_model(model_path)
-        self.prototypes, self.label_map = self._load_prototypes(prototypes_path)
+
+        if prototypes_path.endswith(".pt"):
+            self.prototypes, self.label_map = self._load_prototypes(prototypes_path)
+        else:
+            raise ValueError(
+                f"prototypes_path must be a .pt file, got: {prototypes_path}. "
+                "Use compute_prototypes_from_data() to create prototypes from processed data."
+            )
         self.num_classes = self.prototypes.shape[0]
 
         if not self.label_map and split_json:
@@ -595,6 +602,180 @@ def main():
 
     if args.output:
         infer.save_results(results, args.output)
+
+
+def compute_prototypes_from_data(
+    data_path: str,
+    split_dict_path: str,
+    model_path: str,
+    output_path: str,
+    label_map: Optional[Dict[int, str]] = None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+):
+    """
+    Compute prototypes from processed PyG data + trained model.
+
+    Args:
+        data_path: Path to data.pt (contains (Data, dict) tuple from PyG InMemoryDataset)
+        split_dict_path: Path to split_dict.pt (contains train/val/test indices)
+        model_path: Path to model checkpoint (.pt)
+        output_path: Path to save prototypes.pt
+        label_map: Optional dict mapping class idx → library name
+        device: Device to run on
+
+    Data format:
+        data[0] = Data with concatenated graphs (data[0].x=[total_nodes, 128], data[0].edge_index=[2, total_edges])
+        data[1] = dict with slices for each graph + metadata (y, split, graph_id, etc.)
+    """
+    log.info("Loading data from %s", data_path)
+    data_obj = torch.load(data_path, map_location=device, weights_only=False)
+
+    if not isinstance(data_obj, tuple) or len(data_obj) != 2:
+        raise ValueError(f"data_path must contain (Data, dict) tuple, got {type(data_obj)}")
+
+    data_full = data_obj[0]
+    data_dict = data_obj[1]
+
+    num_graphs = len(data_dict['y'])
+    labels = data_dict['y'].cpu().numpy()
+    log.info("Data format: (Data, dict) with %d graphs", num_graphs)
+    log.info("  data[0].x shape: %s, edge_index shape: %s", data_full.x.shape, data_full.edge_index.shape)
+
+    log.info("Loading split dict from %s", split_dict_path)
+    split_dict = torch.load(split_dict_path, map_location='cpu', weights_only=False)
+
+    if isinstance(split_dict, dict) and 'train' in split_dict:
+        train_indices = split_dict['train']
+        if isinstance(train_indices, torch.Tensor):
+            train_indices = train_indices.cpu().numpy()
+    else:
+        raise ValueError(f"split_dict missing 'train' key. Keys: {split_dict.keys()}")
+
+    log.info("Loading model from %s", model_path)
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    model = ckpt.get("model", ckpt)
+    if hasattr(model, "to"):
+        model = model.to(device)
+    if hasattr(model, "eval"):
+        model.eval()
+
+    num_classes = int(labels.max()) + 1
+    embedding_dim = 128
+
+    if hasattr(model, "model") and hasattr(model.model, "dim_inner"):
+        embedding_dim = model.model.dim_inner
+        log.info("Detected embedding_dim from model: %d", embedding_dim)
+    elif hasattr(model, "dim_inner"):
+        embedding_dim = model.dim_inner
+        log.info("Detected embedding_dim from model: %d", embedding_dim)
+    else:
+        log.warning("Could not detect embedding_dim, using default: %d", embedding_dim)
+
+    log.info("Computing prototypes from %d training samples, %d classes",
+             len(train_indices), num_classes)
+
+    support_embeddings: List[List[torch.Tensor]] = [[] for _ in range(num_classes)]
+
+    edge_index_full = data_full.edge_index
+    edge_attr_full = data_full.edge_attr
+    x_full = data_full.x
+
+    class JSLibsDataset(torch.utils.data.Dataset):
+        def __init__(self, data_full, data_dict, indices):
+            self.data_full = data_full
+            self.data_dict = data_dict
+            self.indices = indices
+
+        def __len__(self):
+            return len(self.indices)
+
+        def __getitem__(self, idx):
+            graph_idx = self.indices[idx]
+            label = int(self.data_dict['y'][graph_idx].item())
+            node_start = int(self.data_dict['x'][graph_idx].item())
+            node_end = int(self.data_dict['x'][graph_idx + 1].item()) if graph_idx + 1 < len(self.data_dict['x']) else len(self.data_full.x)
+            num_nodes = node_end - node_start
+
+            edge_start = graph_idx * num_nodes
+            edge_end = (graph_idx + 1) * num_nodes
+
+            return {
+                'x': self.data_full.x[node_start:node_end],
+                'edge_index': self.data_full.edge_index[:, edge_start:edge_end],
+                'edge_attr': self.data_full.edge_attr[edge_start:edge_end] if self.data_full.edge_attr is not None else None,
+                'y': label,
+                'graph_idx': graph_idx,
+                'num_nodes': num_nodes,
+            }
+
+    dataset = JSLibsDataset(data_full, data_dict, train_indices)
+    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0)
+
+    with torch.no_grad():
+        for batch in loader:
+            x = batch['x'].to(device)
+            edge_index = batch['edge_index'].to(device)
+            edge_attr = batch['edge_attr'].to(device) if batch['edge_attr'] is not None else None
+            batch_labels = batch['y'].numpy()
+            num_nodes_list = batch['num_nodes'].tolist()
+
+            data_list = []
+            for i in range(x.shape[0]):
+                num_n = num_nodes_list[i]
+                ei = edge_index[:, :sum(num_nodes_list[:i+1])] if i > 0 else edge_index[:, :num_nodes_list[0]]
+                g = Data(
+                    x=x[i][:num_n],
+                    edge_index=ei - ei.min(),
+                    edge_attr=edge_attr[i][:num_nodes_list[i]] if edge_attr is not None else None
+                )
+                data_list.append(g)
+
+            from torch_geometric.data import Batch
+            batch_data = Batch.from_data_list(data_list).to(device)
+            out = model(batch_data)
+
+            if isinstance(out, tuple):
+                embeddings = out[0]
+            else:
+                embeddings = out
+
+            embeddings = embeddings.cpu()
+            batch_labels = batch_labels.flatten()
+
+            for emb, lbl in zip(embeddings, batch_labels):
+                lbl_int = int(lbl)
+                if 0 <= lbl_int < num_classes:
+                    support_embeddings[lbl_int].append(emb)
+
+            log.info("Processed batch: %d samples", len(batch_labels))
+
+    prototypes = torch.zeros(num_classes, embedding_dim, dtype=torch.float32)
+    valid_classes = 0
+
+    for c in range(num_classes):
+        if support_embeddings[c]:
+            stacked = torch.stack(support_embeddings[c], dim=0)
+            prototype = stacked.mean(dim=0)
+            prototype = F.normalize(prototype, p=2, dim=0)
+            prototypes[c] = prototype
+            valid_classes += 1
+            log.info("Class %d: %d support embeddings, prototype norm=%.4f",
+                     c, len(support_embeddings[c]), prototype.norm().item())
+        else:
+            log.warning("No support embeddings for class %d", c)
+
+    log.info("Computed %d valid prototypes (out of %d classes)", valid_classes, num_classes)
+
+    if label_map is None:
+        unique_labels = sorted(set(labels[train_indices]))
+        label_map = {i: str(i) for i in range(num_classes)}
+
+    torch.save({
+        'prototypes': prototypes,
+        'label_map': label_map,
+    }, output_path)
+    log.info("Prototypes saved to %s", output_path)
+    return output_path
 
 
 if __name__ == "__main__":
