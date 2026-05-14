@@ -13,17 +13,7 @@ if __name__ == "__main__":
     prototype_path = "results/jslibs-10libs-hash/prototypes.pt"
     model_path = "results/jslibs-10libs-hash/0/ckpt/192.ckpt"
 
-    # Step 1: Compute prototypes from processed data
-    compute_prototypes_from_data(
-        data_path="datasets/JSLibs/processed-10libs-hash/data.pt",
-        split_dict_path="datasets/JSLibs/processed-10libs-hash/split_dict.pt",
-        model_path=model_path,
-        output_path=prototype_path,
-        split_json="datasets/JSLibs/processed-10libs-hash/split.json",
-        device=device,
-    )
-
-    # Step 2: Set up cfg for model instantiation (required by GPSModel)
+    # Step 1: Set up cfg for model instantiation (required by GPSModel)
     _cfg = CfgNode()
     set_cfg(_cfg)
     _cfg.gnn.dim_inner = 128
@@ -42,9 +32,20 @@ if __name__ == "__main__":
     _cfg.dataset.node_encoder = False
     _cfg.dataset.edge_encoder = False
 
+    # Step 2: Instantiate model and load state_dict
     model = GPSModel(dim_in=128, dim_out=128)
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state'])
+
+    # Step 3: Compute prototypes from processed data
+    compute_prototypes_from_data(
+        data_path="datasets/JSLibs/processed-10libs-hash/data.pt",
+        split_dict_path="datasets/JSLibs/processed-10libs-hash/split_dict.pt",
+        model_path=model,  # Pass model object, not path
+        output_path=prototype_path,
+        split_json="datasets/JSLibs/processed-10libs-hash/split.json",
+        device=device,
+    )
 
     infer = PrototypeInference(
         model_path="dummy",
