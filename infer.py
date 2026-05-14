@@ -26,23 +26,16 @@ from graphgps.network.gps_model import GPSModel
 
 
 def main():
-    parser = argparse.ArgumentParser(description="JSLibs Prototype Inference")
-    parser.add_argument(
-        "--cfg",
-        default="configs/custom/jslibs-inference.yaml",
-        help="Path to config YAML file",
-    )
-    parser.add_argument(
-        "--compute_prototypes",
-        action="store_true",
-        help="Recompute prototypes from training data",
-    )
-    parser.add_argument(
-        "--out_dir",
-        default=None,
-        help="Override output directory",
-    )
-    args = parser.parse_args()
+    # ---- Parse cmd line args (use PyG parse_args for --cfg support) ----
+    args = parse_args()
+
+    # Add custom args
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compute_prototypes", action="store_true",
+                        help="Recompute prototypes from training data")
+    parser.add_argument("--out_dir", default=None,
+                        help="Override output directory")
+    extra_args = parser.parse_known_args()[0]
 
     # ---- Load config from YAML ----
     set_cfg(cfg)
@@ -67,7 +60,7 @@ def main():
 
     # ---- Compute prototypes (optional) ----
     prototypes_path = cfg.inference.prototypes
-    if args.compute_prototypes or not osp.exists(prototypes_path):
+    if extra_args.compute_prototypes or not osp.exists(prototypes_path):
         logging.info("Computing prototypes from training data...")
         compute_prototypes_from_data(
             data_path=cfg.inference.data_path,
@@ -99,8 +92,8 @@ def main():
     infer.print_results(results)
 
     output_json = cfg.inference.output_json
-    if args.out_dir:
-        output_json = osp.join(args.out_dir, osp.basename(output_json))
+    if extra_args.out_dir:
+        output_json = osp.join(extra_args.out_dir, osp.basename(output_json))
     infer.save_results(results, output_json)
     logging.info(f"Results saved to {output_json}")
 
