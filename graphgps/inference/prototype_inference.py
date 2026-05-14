@@ -15,17 +15,21 @@ load_type:
   - 'individual': Load pre-extracted subgraph files directly
 
 Usage:
-  >>> # Load entire program CPGs and extract subgraphs
+  >>> # For state_dict checkpoints, use set_model() after instantiation:
+  >>> from graphgps.network.gps_model import GPSModel
+  >>> model = GPSModel(dim_in=128, dim_out=128)
+  >>> model.load_state_dict(torch.load("ckpt.pt", weights_only=False)['model_state'])
   >>> infer = PrototypeInference(
-  ...     model_path="results/run1/model.pt",
+  ...     model_path="dummy",
   ...     prototypes_path="results/run1/jslibs_prototypes.pt",
   ...     load_type="entire",
   ... )
+  >>> infer.set_model(model)
   >>> results = infer.predict("path/to/bundle/graphs/_program.xml")
 
   >>> # Load pre-extracted individual subgraph files
   >>> infer = PrototypeInference(
-  ...     model_path="results/run1/model.pt",
+  ...     model_path="results/run1/model.pt",  # or full model checkpoint
   ...     prototypes_path="results/run1/jslibs_prototypes.pt",
   ...     load_type="individual",
   ... )
@@ -109,12 +113,52 @@ class PrototypeInference:
     def _load_model(self, model_path: str):
         log.info("Loading model from %s", model_path)
         ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
-        model = ckpt.get("model", ckpt)
+
+        state_dict = None
+        if isinstance(ckpt, dict):
+            for key in ('model_state', 'MODEL_STATE'):
+                if key in ckpt:
+                    state_dict = ckpt[key]
+                    log.info("Found %s in checkpoint", key)
+                    break
+            if state_dict is None:
+                model = ckpt.get("model", ckpt)
+                if not hasattr(model, "__call__") and not hasattr(model, "forward"):
+                    raise ValueError(
+                        f"Checkpoint is a dict but no 'model_state'/'MODEL_STATE' key found. "
+                        f"Keys: {list(ckpt.keys())}"
+                    )
+            else:
+                model = None
+        else:
+            model = ckpt
+
+        if model is None:
+            raise RuntimeError(
+                "This function requires a pre-instantiated model when using state_dict checkpoints. "
+                "Use compute_prototypes_from_data() instead, which handles this automatically, "
+                "or manually instantiate a model and use set_model() to pass it."
+            )
+
         if hasattr(model, "to"):
             model = model.to(self.device)
         if hasattr(model, "eval"):
             model.eval()
         return model
+
+    def set_model(self, model):
+        """
+        Set a pre-instantiated model after construction.
+
+        Use this when loading from a state_dict checkpoint:
+            >>> model = GPSModel(dim_in=128, dim_out=128)
+            >>> ckpt = torch.load(path, weights_only=False)
+            >>> model.load_state_dict(ckpt['model_state'])
+            >>> infer = PrototypeInference(...)
+            >>> infer.set_model(model)
+        """
+        self.model = model.to(self.device)
+        self.model.eval()
 
     def _load_prototypes(self, prototypes_path: str) -> Tuple[torch.Tensor, Dict[int, str]]:
         log.info("Loading prototypes from %s", prototypes_path)
@@ -670,21 +714,28 @@ def compute_prototypes_from_data(
         log.info("Loading model from %s", model_path)
         ckpt = torch.load(model_path, map_location=device, weights_only=False)
 
-        if isinstance(ckpt, dict) and "model_state" in ckpt:
-            log.warning("Checkpoint contains state_dict. You must provide a model instance, not a path.")
-            raise TypeError(
-                "Checkpoint only contains state_dict. Pass an instantiated model object instead of a path. "
-                "Example: model = GPSModel(dim_in=128, dim_out=128); "
-                "model.load_state_dict(torch.load(path, weights_only=False)['model_state'])"
-            )
-
         if isinstance(ckpt, dict):
-            if "model" in ckpt and hasattr(ckpt["model"], "__call__"):
-                model = ckpt["model"]
-            elif hasattr(ckpt, "__call__"):
+            state_dict = None
+            for key in ('model_state', 'MODEL_STATE'):
+                if key in ckpt:
+                    state_dict = ckpt[key]
+                    log.info("Found %s in checkpoint", key)
+                    break
+
+            if state_dict is not None:
+                raise TypeError(
+                    f"Checkpoint contains state_dict (key='{key}'), not a full model object. "
+                    "You must provide a pre-instantiated model when using state_dict checkpoints. "
+                    "Example:\n"
+                    "  from graphgps.network.gps_model import GPSModel\n"
+                    "  model = GPSModel(dim_in=128, dim_out=128)\n"
+                    "  model.load_state_dict(torch.load(path, weights_only=False)['model_state'])\n"
+                    "  compute_prototypes_from_data(..., model_path=model, ...)"
+                )
+
+            model = ckpt.get("model", ckpt)
+            if not hasattr(model, "__call__") and not hasattr(model, "forward"):
                 model = ckpt
-            else:
-                model = ckpt.get("model", ckpt)
         else:
             model = ckpt
     else:
