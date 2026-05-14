@@ -667,11 +667,27 @@ def compute_prototypes_from_data(
     num_classes = len(label_map)
     log.info("Loading model from %s", model_path)
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
-    model = ckpt.get("model", ckpt)
-    if hasattr(model, "to"):
-        model = model.to(device)
-    if hasattr(model, "eval"):
-        model.eval()
+
+    if isinstance(ckpt, dict):
+        log.info("Checkpoint keys: %s", list(ckpt.keys()))
+        if "model" in ckpt:
+            model = ckpt["model"]
+        elif "encoder" in ckpt:
+            model = ckpt["encoder"]
+        else:
+            for k, v in ckpt.items():
+                if isinstance(v, torch.nn.Module):
+                    model = v
+                    break
+            else:
+                model = ckpt
+    else:
+        model = ckpt
+
+    log.info("Model type: %s, callable: %s", type(model), callable(model))
+
+    if isinstance(model, dict):
+        raise TypeError(f"Model extracted as dict: {model.keys()}. Check checkpoint structure.")
 
     num_classes = len(label_map)
     embedding_dim = 128
@@ -728,8 +744,11 @@ def compute_prototypes_from_data(
     dataset = JSLibsDataset(data_full, data_dict, train_indices)
 
     with torch.no_grad():
-        for i in range(0, len(dataset), 32):
-            batch_data = [dataset[j] for j in range(i, min(i + 32, len(dataset)))]
+        num_batches = (len(dataset) + 31) // 32
+        for batch_idx in range(num_batches):
+            start = batch_idx * 32
+            end = min(start + 32, len(dataset))
+            batch_data = [dataset[j] for j in range(start, end)]
             batch_pyg = Batch.from_data_list(batch_data).to(device)
             out = model(batch_pyg)
 
@@ -739,7 +758,7 @@ def compute_prototypes_from_data(
                 embeddings = out
 
             embeddings = embeddings.cpu()
-            labels_batch = batch.y.cpu().numpy()
+            labels_batch = batch_pyg.y.cpu().numpy()
 
             for emb, lbl in zip(embeddings, labels_batch):
                 lbl_int = int(lbl)
