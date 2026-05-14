@@ -1,66 +1,109 @@
+"""
+infer.py — JSLibs Prototype-Based Inference
+
+Usage:
+    python infer.py --cfg configs/custom/jslibs-inference.yaml
+
+Loads config from YAML, builds model, runs inference on test data.
+"""
+
+import argparse
+import logging
+import os.path as osp
+from pathlib import Path
+
+import torch
+
+from torch_geometric.graphgym.cmd_args import parse_args
+from torch_geometric.graphgym.config import cfg, dump_cfg, set_cfg, load_cfg
+
+import graphgps  # noqa, register custom modules
 from graphgps.inference.prototype_inference import (
     PrototypeInference,
     compute_prototypes_from_data,
 )
 from graphgps.network.gps_model import GPSModel
 
-if __name__ == "__main__":
-    import torch
-    from torch_geometric.graphgym.config import set_cfg, cfg
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    prototype_path = "results/jslibs-10libs-hash/prototypes.pt"
-    model_path = "results/jslibs-10libs-hash/0/ckpt/192.ckpt"
-
-    # Set up global cfg for GPSModel (matches configs/custom/jslibs.yaml)
-    set_cfg(cfg)
-    cfg.gnn.dim_inner = 64
-    cfg.gt.dim_hidden = 64
-    cfg.gt.layer_type = 'CustomGatedGCN+Performer'
-    cfg.gt.layers = 3
-    cfg.gt.n_heads = 4
-    cfg.gt.dropout = 0.1
-    cfg.gt.attn_dropout = 0.5
-    cfg.gt.layer_norm = False
-    cfg.gt.batch_norm = True
-    cfg.gnn.layers_pre_mp = 0
-    cfg.gnn.head = 'prototype'
-    cfg.dataset.node_encoder = True
-    cfg.dataset.node_encoder_name = 'CPGNode'
-    cfg.dataset.node_encoder_bn = False
-    cfg.dataset.edge_encoder = True
-    cfg.dataset.edge_encoder_name = 'CPGEdge'
-    cfg.dataset.edge_encoder_bn = False
-
-    # Step 2: Instantiate model and load state_dict
-    model = GPSModel(dim_in=128, dim_out=128)
-    ckpt = torch.load(model_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model_state'])
-
-    # Step 3: Compute prototypes from processed data
-    compute_prototypes_from_data(
-        data_path="datasets/JSLibs/processed-10libs-hash/data.pt",
-        split_dict_path="datasets/JSLibs/processed-10libs-hash/split_dict.pt",
-        model_path=model,  # Pass model object, not path
-        output_path=prototype_path,
-        split_json="datasets/JSLibs/processed-10libs-hash/split.json",
-        device=device,
+def main():
+    parser = argparse.ArgumentParser(description="JSLibs Prototype Inference")
+    parser.add_argument(
+        "--cfg",
+        default="configs/custom/jslibs-inference.yaml",
+        help="Path to config YAML file",
     )
+    parser.add_argument(
+        "--compute_prototypes",
+        action="store_true",
+        help="Recompute prototypes from training data",
+    )
+    parser.add_argument(
+        "--out_dir",
+        default=None,
+        help="Override output directory",
+    )
+    args = parser.parse_args()
 
+    # ---- Load config from YAML ----
+    set_cfg(cfg)
+    load_cfg(cfg, args)
+    dump_cfg(cfg)
+
+    device = cfg.inference.device if hasattr(cfg, "inference") and hasattr(cfg.inference, "device") else "cuda"
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    device = torch.device(device)
+
+    # ---- Build model and load checkpoint ----
+    logging.info("Building model...")
+    model = GPSModel(dim_in=cfg.gnn.dim_inner, dim_out=cfg.gnn.dim_inner)
+
+    ckpt_path = cfg.inference.model_ckpt
+    logging.info(f"Loading checkpoint from {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+    model = model.to(device)
+    model.eval()
+
+    # ---- Compute prototypes (optional) ----
+    prototypes_path = cfg.inference.prototypes
+    if args.compute_prototypes or not osp.exists(prototypes_path):
+        logging.info("Computing prototypes from training data...")
+        compute_prototypes_from_data(
+            data_path=cfg.inference.data_path,
+            split_dict_path=cfg.inference.split_dict_path,
+            model_path=model,
+            output_path=prototypes_path,
+            split_json=cfg.inference.prototypes_split_json,
+            device=device,
+        )
+        logging.info(f"Prototypes saved to {prototypes_path}")
+
+    # ---- Run inference ----
+    logging.info("Setting up inference pipeline...")
     infer = PrototypeInference(
         model_path="dummy",
-        prototypes_path=prototype_path,
-        load_type="individual",
-        split_json="datasets/JSLibs/processed-10libs-hash/split.json",
+        prototypes_path=prototypes_path,
+        load_type=cfg.inference.load_type,
+        split_json=cfg.inference.prototypes_split_json,
         device=device,
     )
     infer.set_model(model)
 
-    results = infer.predict(
-        "datasets/JSLibs/test/10libs/async-axios-chalk-debug-lodash/",
-        topk=3,
-        topk_per_graph=3,
-    )
+    input_path = cfg.inference.input_path
+    topk = cfg.inference.topk if hasattr(cfg.inference, "topk") else 5
+    topk_per_graph = cfg.inference.topk_per_graph if hasattr(cfg.inference, "topk_per_graph") else 3
+
+    logging.info(f"Running inference on: {input_path}")
+    results = infer.predict(input_path, topk=topk, topk_per_graph=topk_per_graph)
     infer.print_results(results)
 
-    infer.save_results(results, "tmp/infer_results.json")
+    output_json = cfg.inference.output_json
+    if args.out_dir:
+        output_json = osp.join(args.out_dir, osp.basename(output_json))
+    infer.save_results(results, output_json)
+    logging.info(f"Results saved to {output_json}")
+
+
+if __name__ == "__main__":
+    main()

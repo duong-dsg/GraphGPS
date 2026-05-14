@@ -1,0 +1,75 @@
+# ================================================================
+# GraphGPS — JSLibs Prototype Inference
+# Run: python infer.py --cfg configs/custom/jslibs-inference.yaml
+# ================================================================
+
+out_dir: results
+name_tag: inference
+
+# ----------------------------------------------------------------
+# Inference
+# ----------------------------------------------------------------
+inference:
+  model_ckpt: results/jslibs-10libs-hash/0/ckpt/192.ckpt  # trained model checkpoint
+  prototypes: results/jslibs-10libs-hash/prototypes.pt     # class prototypes
+  prototypes_split_json: datasets/JSLibs/raw/split.json   # split.json used for label_map
+  data_path: datasets/JSLibs/processed-10libs-hash/data.pt
+  split_dict_path: datasets/JSLibs/processed-10libs-hash/split_dict.pt
+  input_path: datasets/JSLibs/test/10libs/async-axios-chalk-debug-lodash/
+  load_type: individual  # individual or entire
+  topk: 5
+  topk_per_graph: 3
+  output_json: results/inference_results.json
+  device: cuda
+
+# ----------------------------------------------------------------
+# Dataset (for node/edge encoders only)
+# ----------------------------------------------------------------
+dataset:
+  node_encoder: True
+  node_encoder_name: CPGNode
+  node_encoder_bn: False
+  edge_encoder: True
+  edge_encoder_name: CPGEdge
+  edge_encoder_bn: False
+
+# ----------------------------------------------------------------
+# Model (must match training config)
+# ----------------------------------------------------------------
+model:
+  type: GPSModel
+  loss_fun: cross_entropy
+  graph_pooling: max
+
+# ----------------------------------------------------------------
+# GPS layers (must match training config)
+# ----------------------------------------------------------------
+gt:
+  layer_type: CustomGatedGCN+Performer
+  layers: 3
+  n_heads: 4
+  dim_hidden: 64
+  dropout: 0.1
+  attn_dropout: 0.5
+  layer_norm: False
+  batch_norm: True
+
+# ----------------------------------------------------------------
+# GNN head (must match training config)
+# ----------------------------------------------------------------
+gnn:
+  head: prototype
+  layers_pre_mp: 0
+  dim_inner: 64
+  batchnorm: True
+  act: relu
+  dropout: 0.0
+  agg: max
+  normalize_adj: False
+
+# ----------------------------------------------------------------
+# Inference-only settings (no training)
+# ----------------------------------------------------------------
+train:
+  mode: custom
+  batch_size: 32
