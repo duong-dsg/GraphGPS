@@ -726,11 +726,11 @@ def compute_prototypes_from_data(
             return g
 
     dataset = JSLibsDataset(data_full, data_dict, train_indices)
-    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0)
 
     with torch.no_grad():
-        for batch in loader:
-            batch_pyg = Batch.from_data_list(batch).to(device)
+        for i in range(0, len(dataset), 32):
+            batch_data = [dataset[j] for j in range(i, min(i + 32, len(dataset)))]
+            batch_pyg = Batch.from_data_list(batch_data).to(device)
             out = model(batch_pyg)
 
             if isinstance(out, tuple):
