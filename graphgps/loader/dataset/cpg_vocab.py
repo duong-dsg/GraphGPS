@@ -20,17 +20,17 @@ python -m graphgps.loader.dataset.cpg_vocab --raw_dir datasets/JSLibs/raw --labe
 python -m graphgps.loader.dataset.cpg_vocab \
     --raw_dir  datasets/JSLibs/raw \
     --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
-    --lib   async axios lodash express chalk commander react request rxjs uuid  \
     --bundler rollup@4.46.2 webpack@5.95.0 \
+    --spliter @ \
     --verbose
 
 # Inspect file structure to find the right --label_key
 # --max_bundles bundles is more than enough to saturate CPG vocab
 python -m graphgps.loader.dataset.cpg_vocab \
     --raw_dir  datasets/JSLibs/raw \
-    --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
-    --lib   async axios lodash express chalk commander react request rxjs uuid  \
-    --bundler rollup@4.46.2 webpack@5.95.0 \
+    --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2 \
+    --bundler rollup_4.46.2, webpack_5.95.0 \
+    --spliter _ \
     --max_bundles 50
 
 # Then remove processed vocab before run training:
@@ -61,20 +61,20 @@ def _is_lib_dir(name: str, parent: str) -> bool:
                         "raw", "processed")
 
 
-def _lib_matches(lib_ver: str, lib_filter: list) -> bool:
+def _lib_matches(lib_ver: str, lib_filter: list, spliter="@") -> bool:
     """True when lib_filter is empty or lib_ver matches (exact or base name)."""
     if not lib_filter:
         return True
-    base = ("@" + lib_ver.split("@")[1]
-            if lib_ver.startswith("@") else lib_ver.split("@")[0])
+    base = (spliter + lib_ver.split(spliter)[1]
+            if lib_ver.startswith(spliter) else lib_ver.split(spliter)[0])
     return lib_ver in lib_filter or base in lib_filter
 
 
-def _bundler_matches(bundler_ver: str, bundler_filter: list) -> bool:
+def _bundler_matches(bundler_ver: str, bundler_filter: list, spliter="@") -> bool:
     """True when bundler_filter is empty or bundler_ver matches (exact or base)."""
     if not bundler_filter:
         return True
-    bname = bundler_ver.split("@")[0]
+    bname = bundler_ver.split(spliter)[0]
     return bundler_ver in bundler_filter or bname in bundler_filter
 from typing import Dict, List, Optional
 
@@ -290,6 +290,7 @@ def build_vocab(
     lib_filter: list = None,
     bundler_filter: list = None,
     max_bundles: Optional[int] = None,
+    spliter: str = "@",
 ) -> Dict[str, int]:
     """
     Walk every graph file under data_dir and collect node label frequencies.
@@ -309,12 +310,12 @@ def build_vocab(
         lib_dir = osp.join(data_dir, lib_ver)
         if not _is_lib_dir(lib_ver, data_dir):
             continue
-        if not _lib_matches(lib_ver, lib_filter):
+        if not _lib_matches(lib_ver, lib_filter, spliter):
             continue
         for bundler_ver in sorted(os.listdir(lib_dir)):
             if not osp.isdir(osp.join(lib_dir, bundler_ver)):
                 continue
-            if not _bundler_matches(bundler_ver, bundler_filter):
+            if not _bundler_matches(bundler_ver, bundler_filter, spliter):
                 continue
             graphs_dir = osp.join(lib_dir, bundler_ver, "graphs")
             if not osp.isdir(graphs_dir):
@@ -415,6 +416,9 @@ def main():
     parser.add_argument("--label_key", default="label",
                         help="XML attribute/data key name that holds the node label. "
                              "Common values: label, LABEL, code, CODE, name, NAME")
+    parser.add_argument("--spliter",   default="@",
+                        help="Split character for lib and bundler names. "
+                             "Common values: @, _")
     parser.add_argument("--inspect",   action="store_true",
                         help="Print raw structure of first few graph files and exit. "
                              "Use this to find the correct --label_key.")
@@ -429,11 +433,13 @@ def main():
     data_dir       = args.data_dir or args.raw_dir
     lib_filter     = args.lib     or []
     bundler_filter = args.bundler or []
+    spliter        = args.spliter
 
     print(f"raw_dir   : {osp.abspath(args.raw_dir)}")
     print(f"data_dir  : {osp.abspath(data_dir)}")
     print(f"libs      : {lib_filter     if lib_filter     else 'ALL'}")
     print(f"bundlers  : {bundler_filter if bundler_filter else 'ALL'}")
+    print(f"spliter   : {spliter if spliter else '@'}")
 
     # ── inspect mode: show raw file structure ──
     if args.inspect:
@@ -443,12 +449,12 @@ def main():
             lib_dir = osp.join(data_dir, lib_ver)
             if not _is_lib_dir(lib_ver, data_dir):
                 continue
-            if not _lib_matches(lib_ver, lib_filter):
+            if not _lib_matches(lib_ver, lib_filter, spliter):
                 continue
             for bundler_ver in sorted(os.listdir(lib_dir)):
                 if not osp.isdir(osp.join(lib_dir, bundler_ver)):
                     continue
-                if not _bundler_matches(bundler_ver, bundler_filter):
+                if not _bundler_matches(bundler_ver, bundler_filter, spliter):
                     continue
                 graphs_dir = osp.join(lib_dir, bundler_ver, "graphs")
                 if not osp.isdir(graphs_dir):

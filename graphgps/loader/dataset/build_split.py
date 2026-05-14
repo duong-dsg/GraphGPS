@@ -76,6 +76,12 @@ Usage
     --mode closed --seed 42 \
     --bundler rollup_4.46.2 webpack_5.95.0 \
     --spliter _
+
+    python graphgps/loader/dataset/build_split.py \
+    --raw_dir  datasets/JSLibs/raw \
+    --data_dir /home/aiuser4/ado/bundled-js-scan/data/train/v2.2 \
+    --mode closed --seed 42 \
+    --bundler rollup@4.46.2 webpack@5.95.0
 """
 
 import argparse

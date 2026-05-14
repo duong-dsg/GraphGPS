@@ -31,17 +31,17 @@ dataset:
   edge_encoder_bn: False
   split_index: 0
   split_mode: standard
-  data_dir: /home/aiuser4/ado/bundled-js-scan/data/train/v2  # ← new
+  data_dir: /home/aiuser4/ado/bundled-js-scan/data/train/v2.2  # ← new
   min_nodes: 5        # ← new
   max_nodes: 2000     # ← new
-  bundler_filter: [rollup_4.46.2, webpack_5.95.0]  # e.g. [rollup@4.46.2, webpack@5.95.0] # ← new
+  bundler_filter: [rollup@4.46.2, webpack@5.95.0]  # e.g. [rollup@4.46.2, webpack@5.95.0] # ← new
   lib_filter : [] # e.g. ['axios@1.7.9', 'lodash', 'chalk@5.3.0'] # ← new
   loader_type: individual  # ← individual/entire: read per-function or entire graph then extract subgraphs in-memory
   max_depth: None       # ← max depth for subgraph extraction (entire graph mode only)
   closed_train_ratio: None
   closed_val_ratio: None
   node_encoder_vocab_size: 0    # 0 = hash fallback; set after running cpg_vocab.py
-  spliter: "_"            # ← new: split character for lib@version format (default: @)
+  spliter: "@"           # ← new: split character for lib@version format (default: @)
 
 # ----------------------------------------------------------------
 # Positional Encoding — LapPE

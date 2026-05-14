@@ -50,8 +50,9 @@ dataset:
   split_mode: standard
 
   # ── paths (adjust to your setup) ──────────────────────────────
-  data_dir:  /home/aiuser4/ado/bundled-js-scan/data/train/v2.2
+  data_dir:  /home/aiuser4/ado/bundled-js-scan/data/train/v2
   label_map_path: datasets/JSLibs/raw/split.json
+  spliter = "@"
 
   # ── vocab (set after running cpg_vocab.py) ────────────────────
   node_encoder_vocab_size: 0    # 0 = hash fallback
@@ -61,7 +62,7 @@ dataset:
   max_nodes: 500        # tighter than libs_scan: subgraphs are bounded
 
   # ── bundler / lib filters (empty = include everything) ────────
-  bundler_filter: [rollup@4.46.2, rollup@4.46.3]
+  bundler_filter: [rollup_4.46.2, webpack_5.95.0]  # e.g. [rollup@4.46.2, webpack@5.95.0]
   lib_filter: [async]
 
   # ── JSLibsEntire-specific ──────────────────────────────────────
