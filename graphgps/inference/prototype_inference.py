@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 from torch_geometric.loader.dataloader import DataLoader
 
 log = logging.getLogger(__name__)
@@ -710,21 +710,28 @@ def compute_prototypes_from_data(
             node_end = int(self.data_dict['x'][graph_idx + 1].item()) if graph_idx + 1 < len(self.data_dict['x']) else len(self.data_full.x)
             num_nodes = node_end - node_start
 
-            g = Data(
-                x=self.data_full.x[node_start:node_end],
-                edge_index=self.data_full.edge_index[:, node_start:node_end] if self.data_full.edge_index.shape[1] >= node_end else self.data_full.edge_index,
-                edge_attr=self.data_full.edge_attr[node_start:node_end] if self.data_full.edge_attr is not None and self.data_full.edge_attr.shape[0] >= node_end else None,
-                y=torch.tensor(label, dtype=torch.long),
-            )
+            x_graph = self.data_full.x[node_start:node_end]
+            edge_index_graph = self.data_full.edge_index
+            edge_attr_graph = self.data_full.edge_attr
+
+            mask = (edge_index_graph[0] >= node_start) & (edge_index_graph[0] < node_end)
+            ei = edge_index_graph[:, mask].clone()
+            if node_start > 0:
+                ei[0] -= node_start
+                ei[1] -= node_start
+
+            ea = edge_attr_graph[mask] if edge_attr_graph is not None else None
+
+            g = Data(x=x_graph, edge_index=ei, edge_attr=ea, y=torch.tensor(label, dtype=torch.long))
             return g
 
     dataset = JSLibsDataset(data_full, data_dict, train_indices)
-    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0, collate_fn=lambda x: x)
+    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0)
 
     with torch.no_grad():
-        for batch_data in loader:
-            batch = Batch.from_data_list(batch_data).to(device)
-            out = model(batch)
+        for batch in loader:
+            batch_pyg = Batch.from_data_list(batch).to(device)
+            out = model(batch_pyg)
 
             if isinstance(out, tuple):
                 embeddings = out[0]
