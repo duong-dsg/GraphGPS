@@ -690,9 +690,9 @@ def compute_prototypes_from_data(
 
     support_embeddings: List[List[torch.Tensor]] = [[] for _ in range(num_classes)]
 
+    x_full = data_full.x
     edge_index_full = data_full.edge_index
     edge_attr_full = data_full.edge_attr
-    x_full = data_full.x
 
     class JSLibsDataset(torch.utils.data.Dataset):
         def __init__(self, data_full, data_dict, indices):
@@ -710,43 +710,21 @@ def compute_prototypes_from_data(
             node_end = int(self.data_dict['x'][graph_idx + 1].item()) if graph_idx + 1 < len(self.data_dict['x']) else len(self.data_full.x)
             num_nodes = node_end - node_start
 
-            edge_start = graph_idx * num_nodes
-            edge_end = (graph_idx + 1) * num_nodes
-
-            return {
-                'x': self.data_full.x[node_start:node_end],
-                'edge_index': self.data_full.edge_index[:, edge_start:edge_end],
-                'edge_attr': self.data_full.edge_attr[edge_start:edge_end] if self.data_full.edge_attr is not None else None,
-                'y': label,
-                'graph_idx': graph_idx,
-                'num_nodes': num_nodes,
-            }
+            g = Data(
+                x=self.data_full.x[node_start:node_end],
+                edge_index=self.data_full.edge_index[:, node_start:node_end] if self.data_full.edge_index.shape[1] >= node_end else self.data_full.edge_index,
+                edge_attr=self.data_full.edge_attr[node_start:node_end] if self.data_full.edge_attr is not None and self.data_full.edge_attr.shape[0] >= node_end else None,
+                y=torch.tensor(label, dtype=torch.long),
+            )
+            return g
 
     dataset = JSLibsDataset(data_full, data_dict, train_indices)
-    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0)
+    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0, collate_fn=lambda x: x)
 
     with torch.no_grad():
-        for batch in loader:
-            x = batch['x'].to(device)
-            edge_index = batch['edge_index'].to(device)
-            edge_attr = batch['edge_attr'].to(device) if batch['edge_attr'] is not None else None
-            batch_labels = batch['y'].numpy()
-            num_nodes_list = batch['num_nodes'].tolist()
-
-            data_list = []
-            for i in range(x.shape[0]):
-                num_n = num_nodes_list[i]
-                ei = edge_index[:, :sum(num_nodes_list[:i+1])] if i > 0 else edge_index[:, :num_nodes_list[0]]
-                g = Data(
-                    x=x[i][:num_n],
-                    edge_index=ei - ei.min(),
-                    edge_attr=edge_attr[i][:num_nodes_list[i]] if edge_attr is not None else None
-                )
-                data_list.append(g)
-
-            from torch_geometric.data import Batch
-            batch_data = Batch.from_data_list(data_list).to(device)
-            out = model(batch_data)
+        for batch_data in loader:
+            batch = Batch.from_data_list(batch_data).to(device)
+            out = model(batch)
 
             if isinstance(out, tuple):
                 embeddings = out[0]
@@ -754,14 +732,14 @@ def compute_prototypes_from_data(
                 embeddings = out
 
             embeddings = embeddings.cpu()
-            batch_labels = batch_labels.flatten()
+            labels_batch = batch.y.cpu().numpy()
 
-            for emb, lbl in zip(embeddings, batch_labels):
+            for emb, lbl in zip(embeddings, labels_batch):
                 lbl_int = int(lbl)
                 if 0 <= lbl_int < num_classes:
                     support_embeddings[lbl_int].append(emb)
 
-            log.info("Processed batch: %d samples", len(batch_labels))
+            log.info("Processed batch: %d samples", len(labels_batch))
 
     prototypes = torch.zeros(num_classes, embedding_dim, dtype=torch.float32)
     valid_classes = 0
