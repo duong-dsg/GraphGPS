@@ -6,29 +6,31 @@ from graphgps.network.gps_model import GPSModel
 
 if __name__ == "__main__":
     import torch
-    from yacs.config import CfgNode
     from torch_geometric.graphgym.config import set_cfg, cfg
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     prototype_path = "results/jslibs-10libs-hash/prototypes.pt"
     model_path = "results/jslibs-10libs-hash/0/ckpt/192.ckpt"
 
-    # Step 1: Set up global cfg for GPSModel (GPSModel reads from global cfg)
+    # Set up global cfg for GPSModel (matches configs/custom/jslibs.yaml)
     set_cfg(cfg)
-    cfg.gnn.dim_inner = 128
-    cfg.gt.dim_hidden = 128
-    cfg.gt.layer_type = 'GatedGCN+Transformer'
-    cfg.gt.layers = 6
-    cfg.gt.n_heads = 8
-    cfg.gt.dropout = 0.0
-    cfg.gt.attn_dropout = 0.0
-    cfg.gt.layer_norm = True
-    cfg.gt.batch_norm = False
-    cfg.gt.pna_degrees = [4]
+    cfg.gnn.dim_inner = 64
+    cfg.gt.dim_hidden = 64
+    cfg.gt.layer_type = 'CustomGatedGCN+Performer'
+    cfg.gt.layers = 3
+    cfg.gt.n_heads = 4
+    cfg.gt.dropout = 0.1
+    cfg.gt.attn_dropout = 0.5
+    cfg.gt.layer_norm = False
+    cfg.gt.batch_norm = True
     cfg.gnn.layers_pre_mp = 0
     cfg.gnn.head = 'prototype'
-    cfg.dataset.node_encoder = False
-    cfg.dataset.edge_encoder = False
+    cfg.dataset.node_encoder = True
+    cfg.dataset.node_encoder_name = 'CPGNode'
+    cfg.dataset.node_encoder_bn = False
+    cfg.dataset.edge_encoder = True
+    cfg.dataset.edge_encoder_name = 'CPGEdge'
+    cfg.dataset.edge_encoder_bn = False
 
     # Step 2: Instantiate model and load state_dict
     model = GPSModel(dim_in=128, dim_out=128)
